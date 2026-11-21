@@ -136,12 +136,14 @@ boot: svc idle 0 Callbacks1 fault=-7 ret=0x009D961A
 
 `client` is what the running client actually called. `at=` is milliseconds since
 the module attached, stamped on the first hit of that rule with a compare-exchange
-so the earliest thread wins. A boot only reaches the stubs its own code path
-needs, so the idle list is normal and stays visible; the idle lines are printed
-once, in the boot report. The report then repeats every 15 s for 10 minutes as
-`svc t=<sec>: ...`, which is how a long session timestamps the rules it reaches
-after boot instead of needing a second boot. `new` lines appear in whatever
-report first sees that bit, so a rule that fires later shows up as
+so the earliest thread wins; the stamp comes from the performance counter, so it
+has the same clock and resolution as the event ticks. A boot only reaches the
+stubs its own code path needs, so the idle list is normal and stays visible; the
+idle lines are printed once, in the boot report. The report then repeats every
+15 s for 10 minutes as `svc t=<sec>: ...`, where the tag is the measured elapsed
+time, not a counter guess. That is how a long session timestamps the rules it
+reaches after boot instead of needing a second boot. `new` lines appear in
+whatever report first sees that bit, so a rule that fires later shows up as
 `svc t=98: svc new 16 Records1 at=95012ms`.
 
 `self` is a self-test that closes the verification gap: for every rule, the
@@ -256,6 +258,11 @@ Boot-critical failures do not depend on that switch: `detlog::fatal()` writes to
 `boot.log` even in release, and falls back to `%TEMP%\emu_boot.log` when the
 module directory is not known yet. The panic hook, the image guard, every init
 stage and the crash filter all go through it.
+
+`boot.log` is append-only across boots, so it keeps one prior generation: past
+4 MiB the current file becomes `boot.1.log` and a fresh `boot.log` is started.
+A machine that has booted the client a few hundred times carries two sessions of
+forensics, not all of them.
 
 ### 10. Boot sequence
 

@@ -333,10 +333,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
             hdr.version
         ));
     }
-    summary(&hdr);
     let mut freq = 0i64;
     unsafe { QueryPerformanceFrequency(&mut freq) };
     let freq = freq.max(1) as u64;
+    // A reader that wins the race with the DLL maps an empty ring; give the
+    // client a moment to record its first events before printing the tail.
+    let mut hdr = hdr;
+    for _ in 0..20 {
+        if hdr.head != 0 {
+            break;
+        }
+        sleep(Duration::from_millis(250));
+        hdr = header(view);
+    }
+    summary(&hdr);
     let mut seen = tail(view, &hdr, count, freq);
     if follow {
         loop {

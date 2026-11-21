@@ -594,6 +594,7 @@ mod tests {
 
     #[test]
     fn restore_rebuilds_decrypted_image() {
+        let _guard = crate::testlock::lock();
         let Some(exe) = fixture("client_decrypted.exe") else {
             return;
         };
@@ -654,6 +655,7 @@ mod tests {
 
     #[test]
     fn restore_rejects_bad_payload() {
+        let _guard = crate::testlock::lock();
         unsafe {
             let mem = alloc(0x1000);
             assert!(!restore(mem, &[]));
@@ -678,6 +680,7 @@ mod tests {
 
     #[test]
     fn imp_resolves_every_slot_that_can_load() {
+        let _guard = crate::testlock::lock();
         let Some(exe) = fixture("client_decrypted.exe") else {
             return;
         };
@@ -738,6 +741,7 @@ mod tests {
 
     #[test]
     fn gate_patches_apply_to_the_decrypted_image() {
+        let _guard = crate::testlock::lock();
         let Some(exe) = fixture("client_decrypted.exe") else {
             return;
         };
@@ -770,6 +774,7 @@ mod tests {
 
     #[test]
     fn patch_refuses_unknown_source_bytes() {
+        let _guard = crate::testlock::lock();
         unsafe {
             let mem = alloc(0x1000);
             ptr::write_bytes(mem, 0xCC, 0x1000);

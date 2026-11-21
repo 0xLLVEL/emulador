@@ -20,8 +20,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // evidence needed before PROTECTED_SERVICES_VERIFIED can be flipped.
 static COVERAGE_MASK: AtomicU32 = AtomicU32::new(0);
 static COVERAGE_HITS: AtomicU32 = AtomicU32::new(0);
-// First client hit per rule, in GetTickCount64 ms. Probes never write here.
-static FIRST_MS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+// First client hit per rule, in microseconds since the init QPC origin. Probes
+// never write here. 0 means "not hit yet".
+static FIRST_US: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 static REPORTED: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
@@ -57,7 +58,7 @@ pub fn coverage_log(tag: &str) {
             crate::detlog::trace(&format!(
                 "{tag}: svc new {index} {:?} at={}ms",
                 rule.service,
-                FIRST_MS[index].load(Ordering::Acquire)
+                FIRST_US[index].load(Ordering::Acquire) / 1_000
             ));
         }
     }
@@ -397,9 +398,9 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
                 PROBE_MASK.fetch_or(1u32 << index, Ordering::AcqRel);
             } else {
                 mark(index);
-                let _ = FIRST_MS[index].compare_exchange(
+                let _ = FIRST_US[index].compare_exchange(
                     0,
-                    crate::detlog::boot_ms().max(1),
+                    crate::detlog::boot_us().max(1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 );
@@ -775,6 +776,7 @@ mod tests {
 
     #[test]
     fn callbacks_rule_writes_version_and_pointers() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let buf = region.add(0x1000);
@@ -806,6 +808,7 @@ mod tests {
 
     #[test]
     fn records_rule_reports_zero_length() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let stack = alloc(0x1000) as *mut u64;
@@ -835,6 +838,7 @@ mod tests {
 
     #[test]
     fn notice_rule_writes_the_banner() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x20_000);
         unsafe {
             let dst = region.add(0x4000);
@@ -861,6 +865,7 @@ mod tests {
 
     #[test]
     fn timing_rule_produces_monotonic_fields() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let dst = region.add(0x1000);
@@ -893,6 +898,7 @@ mod tests {
 
     #[test]
     fn unmatched_sentinel_is_acknowledged_with_zero() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let stack = alloc(0x1000) as *mut u64;
@@ -908,6 +914,7 @@ mod tests {
 
     #[test]
     fn guard_rejects_unknown_return_site() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let stack = alloc(0x1000) as *mut u64;
@@ -1065,6 +1072,7 @@ mod tests {
 
     #[test]
     fn rule_hit_marks_its_coverage_bit() {
+        let _guard = crate::testlock::lock();
         let region = alloc(0x10_000);
         unsafe {
             let index = p::RULES

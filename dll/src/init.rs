@@ -479,9 +479,10 @@ extern "system" fn svc_report(_: *mut c_void) -> u32 {
     // carries the elapsed seconds. Only a build with the log sink has anywhere
     // to put these lines.
     if detlog::ENABLED {
-        for tick in 1..=40u32 {
+        for _ in 1..=40u32 {
             unsafe { win::Sleep(15_000) };
-            services::coverage_log(&format!("svc t={}", tick * 15 + 8));
+            let seconds = detlog::boot_ms() / 1_000;
+            services::coverage_log(&format!("svc t={seconds}"));
         }
     }
     0

@@ -540,6 +540,7 @@ pub struct ExceptionPointers {
 unsafe extern "system" {
     pub fn GetSystemTimeAsFileTime(time: *mut FileTime);
     pub fn QueryPerformanceCounter(counter: *mut i64) -> BOOL;
+    pub fn QueryPerformanceFrequency(freq: *mut i64) -> BOOL;
     pub fn CreateThread(
         attributes: *mut c_void,
         stack_size: usize,

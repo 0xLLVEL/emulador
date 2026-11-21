@@ -66,6 +66,8 @@ const K_RATE_SLOTS: usize = 64;
 const K_RATE_MASK: u32 = 1 << DetKind::TimingProbe as u32;
 const K_LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const K_LOG_FILES: usize = 4;
+// boot.log keeps one prior generation, so a long-lived install stays bounded.
+const K_BOOT_LIMIT: u64 = 4 * 1024 * 1024;
 
 const _: () = assert!(K_RATE_SLOTS.is_power_of_two());
 
@@ -751,7 +753,14 @@ unsafe fn rotate(g: &mut Globals) {
 // reference name exactly. `want_log` opens the JSONL sink; the shared ring is
 // created either way.
 unsafe fn open(dir: &[u16], base: u64, tag: u32, want_log: bool) -> bool {
-    let g = globals();
+    unsafe { open_with(globals(), dir, base, tag, want_log) }
+}
+
+// Test seam: `open` always targets the process-wide sink, which any test that
+// reaches an emitter can write to. Tests that assert on header contents use a
+// private Globals so a stray lease cannot change what they read.
+unsafe fn open_with(g: &mut Globals, dir: &[u16], base: u64, tag: u32, want_log: bool) -> bool {
+    let g = g;
     if !g.cs_ok {
         unsafe { win::InitializeCriticalSection(&mut g.cs) };
         g.cs_ok = true;
@@ -878,15 +887,42 @@ unsafe fn close() {
     }
 }
 
-// Emulator-origin timestamp for the first-hit stamps, so `at=` reads as ms
-// since the module attached instead of raw system uptime.
-static T0_MS: AtomicU64 = AtomicU64::new(0);
-
+// Emulator-origin timestamp for the first-hit stamps: state::t0 is the QPC
+// value captured at init, so `at=` and the event ticks share one clock.
 pub fn boot_ms() -> u64 {
-    let now = unsafe { win::GetTickCount64() };
-    match T0_MS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed) {
-        Ok(_) => 0,
-        Err(t0) => now.saturating_sub(t0),
+    boot_us() / 1_000
+}
+
+// Microseconds since the QPC origin captured at init. Event ticks already use
+// QPC, so the first-hit stamps now share that clock and resolution.
+pub fn boot_us() -> u64 {
+    let t0 = state::t0();
+    if t0 == 0 {
+        return 0;
+    }
+    let mut now = 0i64;
+    unsafe { win::QueryPerformanceCounter(&mut now) };
+    if now <= t0 {
+        return 0;
+    }
+    let freq = qpc_freq();
+    if freq == 0 {
+        return 0;
+    }
+    ((now - t0) as u128 * 1_000_000 / freq as u128) as u64
+}
+
+fn qpc_freq() -> u64 {
+    static FREQ: AtomicU64 = AtomicU64::new(0);
+    match FREQ.load(Ordering::Acquire) {
+        0 => {
+            let mut value = 0i64;
+            unsafe { win::QueryPerformanceFrequency(&mut value) };
+            let value = value.max(0) as u64;
+            FREQ.store(value, Ordering::Release);
+            value
+        }
+        freq => freq,
     }
 }
 
@@ -895,12 +931,6 @@ pub fn det_init() -> bool {
     if !live {
         return true;
     }
-    let _ = T0_MS.compare_exchange(
-        0,
-        unsafe { win::GetTickCount64() },
-        Ordering::AcqRel,
-        Ordering::Relaxed,
-    );
     unsafe { open(state::dir(), state::base() as u64, 0, ENABLED) }
 }
 
@@ -1019,6 +1049,13 @@ pub fn trace_bytes(text: &[u8]) {
 // boot.log sits next to the host image instead of the reference's hardcoded
 // D:\CLAUMI path.
 pub unsafe fn write_trace(dir: &[u16], text: &[u8]) {
+    unsafe { write_trace_limit(dir, text, K_BOOT_LIMIT) }
+}
+
+// boot.log is append-only across boots: without a ceiling a machine that has
+// booted the client a few hundred times carries every session's forensics into
+// the next one. Past the limit the file is replaced, keeping one generation.
+unsafe fn write_trace_limit(dir: &[u16], text: &[u8], limit: u64) {
     if dir.is_empty() {
         return;
     }
@@ -1026,13 +1063,36 @@ pub unsafe fn write_trace(dir: &[u16], text: &[u8]) {
     if !path.push_slice(dir) || !path.push_ascii("\\boot.log") {
         return;
     }
-    let handle = create_append(path.as_ptr());
+    let mut handle = create_append(path.as_ptr());
     if handle == win::INVALID_HANDLE_VALUE || handle.is_null() {
         return;
+    }
+    let mut size = 0i64;
+    if unsafe { win::GetFileSizeEx(handle, &mut size) } != 0 && size as u64 > limit {
+        unsafe { win::CloseHandle(handle) };
+        unsafe { rotate_boot(dir) };
+        handle = create_append(path.as_ptr());
+        if handle == win::INVALID_HANDLE_VALUE || handle.is_null() {
+            return;
+        }
     }
     write_file(handle, text.as_ptr(), text.len());
     write_file(handle, b"\r\n".as_ptr(), 2);
     unsafe { win::CloseHandle(handle) };
+}
+
+unsafe fn rotate_boot(dir: &[u16]) {
+    let mut from = WideBuf::<{ win::MAX_PATH }>::new();
+    let mut to = WideBuf::<{ win::MAX_PATH }>::new();
+    if !from.push_slice(dir) || !from.push_ascii("\\boot.log") {
+        return;
+    }
+    if !to.push_slice(dir) || !to.push_ascii("\\boot.1.log") {
+        return;
+    }
+    unsafe {
+        win::MoveFileExW(from.as_ptr(), to.as_ptr(), win::MOVEFILE_REPLACE_EXISTING)
+    };
 }
 
 // Same append path rooted in %TEMP%, for failures before init() knows the
@@ -1495,9 +1555,10 @@ mod tests {
     fn header_is_zeroed_and_stamped_on_open() {
         let _guard = crate::testlock::lock();
         let dir = TempDir::new("stamp");
-        unsafe { close() };
-        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0004, true) });
-        let g = globals();
+        // Private Globals: another test can lease the process-wide ring at any
+        // time, and this test asserts that a fresh header starts at zero.
+        let mut g = Globals::empty();
+        assert!(unsafe { open_with(&mut g, &dir.wide(), 0x1400_0000, 0x5EED_0004, true) });
         assert_eq!(unsafe { (*g.hdr).magic }, K_MAGIC);
         assert_eq!(unsafe { (*g.hdr).version }, K_VERSION);
         assert_eq!(unsafe { (*g.hdr).capacity }, K_CAPACITY);
@@ -1507,7 +1568,11 @@ mod tests {
         assert_eq!(unsafe { (*g.hdr).drop }, 0);
         assert_eq!(unsafe { (*g.hdr).heat }, 0);
         assert_ne!(unsafe { (*g.hdr).start }, 0);
-        unsafe { close() };
+        unsafe {
+            win::UnmapViewOfFile(g.hdr as *const c_void);
+            win::CloseHandle(g.map);
+            win::CloseHandle(g.log);
+        }
     }
 
     #[test]
@@ -1615,6 +1680,8 @@ mod tests {
         let _guard = crate::testlock::lock();
         // The release configuration compiles the sink out.
         if !ENABLED {
+            unsafe { close() };
+            assert!(!ACTIVE.load(Ordering::Acquire));
             det(
                 DetSource::Emulator,
                 DetKind::Resolve,
@@ -1625,8 +1692,10 @@ mod tests {
                 0,
                 0,
             );
-            assert_eq!(det_heat(), 0);
-            assert!(det_init());
+            // No ring, no log: the write path must not have been reached at all,
+            // so nothing here can be another test's counters.
+            assert_eq!(det_events(), 0);
+            assert_eq!(det_log_state().1, 0);
             det_snapshot();
             trace("ignored");
             unsafe { det_close() };
@@ -1748,6 +1817,22 @@ mod tests {
     }
 
     #[test]
+    fn boot_log_keeps_one_generation() {
+        let _guard = crate::testlock::lock();
+        let dir = TempDir::new("bootlog");
+        let wide = dir.wide();
+        unsafe { write_trace_limit(&wide, b"first", 8) };
+        unsafe { write_trace_limit(&wide, b"second", 8) };
+        assert!(!dir.file("boot.1.log").exists());
+        unsafe { write_trace_limit(&wide, b"third", 8) };
+        let newest = dir.text("boot.log");
+        assert_eq!(newest, "third\r\n");
+        let previous = dir.text("boot.1.log");
+        assert!(previous.contains("first"));
+        assert!(previous.contains("second"));
+    }
+
+    #[test]
     fn flush_requires_a_live_handle() {
         let mut g = Globals::empty();
         assert!(!flush_log(&g));
@@ -1765,6 +1850,9 @@ mod tests {
 
     #[test]
     fn observe_reads_the_environment() {
+        // The environment block and the armed event are process-wide, so these
+        // two observe tests must not see each other's setup.
+        let _guard = crate::testlock::lock();
         // std::env writes the real process block, so this is the exact lookup
         // the client performs at load time.
         unsafe { std::env::set_var("EMU_OBSERVE", "1") };
@@ -1777,6 +1865,7 @@ mod tests {
 
     #[test]
     fn observe_armed_event_is_enough() {
+        let _guard = crate::testlock::lock();
         let name: [u16; 20] = [
             0x4C, 0x6F, 0x63, 0x61, 0x6C, 0x5C, 0x52, 0x6F, 0x62, 0x6C, 0x6F, 0x78, 0x4F, 0x62,
             0x73, 0x65, 0x72, 0x76, 0x65, 0,
