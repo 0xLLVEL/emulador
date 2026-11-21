@@ -362,19 +362,67 @@ fn print_event(entry: &Event, base: u64, start: u64, freq: u64, json: bool) {
     );
 }
 
+fn elapsed_ms(hdr: &Header, freq: u64) -> u64 {
+    if hdr.start == 0 || freq == 0 {
+        return 0;
+    }
+    let mut now = 0i64;
+    unsafe { QueryPerformanceCounter(&mut now) };
+    let now = now.max(0) as u64;
+    if now <= hdr.start {
+        return 0;
+    }
+    (now - hdr.start) * 1000 / freq
+}
+
+fn eps_avg(head: u32, elapsed_ms: u64) -> u64 {
+    if elapsed_ms == 0 {
+        0
+    } else {
+        (head as u64).saturating_mul(1000) / elapsed_ms
+    }
+}
+
 fn summary(hdr: &Header, freq: u64, torn: u64, json: bool) {
     let idle = idle_ms(hdr, freq);
     let heat = heat_now(hdr, freq);
+    let elapsed = elapsed_ms(hdr, freq);
+    // `head` counts accepted records; the average rate is that over the time
+    // since attach. `rate` in the header is dropped samples from the 100 ms
+    // gate, so it is reported as `drop_rate` and never as events per second.
+    let eps_avg = eps_avg(hdr.head, elapsed);
     if json {
         println!(
-            "{{\"pid\":{},\"base\":\"{:#X}\",\"capacity\":{},\"heat\":{},\"heat_now\":{},\"idle_ms\":{},\"events\":{},\"drop\":{},\"rate\":{},\"torn\":{}}}",
-            hdr.pid, hdr.base, hdr.capacity, hdr.heat, heat, idle, hdr.head, hdr.drop, hdr.rate, torn
+            "{{\"pid\":{},\"base\":\"{:#X}\",\"capacity\":{},\"heat\":{},\"heat_now\":{},\"idle_ms\":{},\"elapsed_ms\":{},\"events\":{},\"drop\":{},\"drop_rate\":{},\"eps_avg\":{},\"torn\":{}}}",
+            hdr.pid,
+            hdr.base,
+            hdr.capacity,
+            hdr.heat,
+            heat,
+            idle,
+            elapsed,
+            hdr.head,
+            hdr.drop,
+            hdr.rate,
+            eps_avg,
+            torn
         );
         return;
     }
     println!(
-        "pid={} base={:#X} capacity={} heat={} heat_now={} idle={}ms events={} drop={} rate={} torn={}",
-        hdr.pid, hdr.base, hdr.capacity, hdr.heat, heat, idle, hdr.head, hdr.drop, hdr.rate, torn
+        "pid={} base={:#X} capacity={} heat={} heat_now={} idle={}ms elapsed={}ms events={} drop={} drop_rate={} eps_avg={} torn={}",
+        hdr.pid,
+        hdr.base,
+        hdr.capacity,
+        hdr.heat,
+        heat,
+        idle,
+        elapsed,
+        hdr.head,
+        hdr.drop,
+        hdr.rate,
+        eps_avg,
+        torn
     );
 }
 
@@ -515,8 +563,12 @@ fn audit(view: *const u8, hdr: &Header, json: bool) {
     }
     for (rva, bucket) in &services {
         println!(
-            "svc ret={:#010X} n={:<5} first={:<6} last={}",
-            rva, bucket.count, bucket.first, bucket.last
+            "svc {:<14} ret={:#010X} n={:<5} first={:<6} last={}",
+            service_name(*rva),
+            rva,
+            bucket.count,
+            bucket.first,
+            bucket.last
         );
     }
 }
@@ -551,12 +603,48 @@ fn json_services(services: &[(u64, Bucket)]) -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"ret\":\"{:#X}\",\"n\":{},\"first\":{},\"last\":{}}}",
-            rva, bucket.count, bucket.first, bucket.last
+            "{{\"name\":\"{}\",\"ret\":\"{:#X}\",\"n\":{},\"first\":{},\"last\":{}}}",
+            service_name(*rva),
+            rva,
+            bucket.count,
+            bucket.first,
+            bucket.last
         ));
     }
     out.push(']');
     out
+}
+
+// Stable identity of a service rule is its return RVA; the name is the same
+// `Service` variant the profile carries. Kept here because xtask is a separate
+// crate; validate cross-checks the pair against profile.rs so the table cannot
+// drift silently.
+const SERVICES: [(u64, &str); 18] = [
+    (0x009D961A, "Callbacks1"),
+    (0x009DC02A, "Callbacks2"),
+    (0x00E7D7CA, "Callbacks3"),
+    (0x0292C04A, "Callbacks4"),
+    (0x0292EE01, "Callbacks5"),
+    (0x02935261, "Acknowledge1"),
+    (0x034A584C, "Acknowledge2"),
+    (0x034A5877, "Acknowledge3"),
+    (0x04CC081A, "Callbacks6"),
+    (0x04E53076, "Acknowledge4"),
+    (0x04E530A4, "Timing1"),
+    (0x04E530C4, "Notice1"),
+    (0x04E530F8, "Challenge1"),
+    (0x04E53134, "Acknowledge5"),
+    (0x04E537A4, "Acknowledge6"),
+    (0x04E537C1, "Acknowledge7"),
+    (0x04E540CF, "Records1"),
+    (0x04E5411F, "Records2"),
+];
+
+fn service_name(rva: u64) -> &'static str {
+    match SERVICES.iter().find(|(known, _)| *known == rva) {
+        Some((_, name)) => name,
+        None => "unknown",
+    }
 }
 
 fn parse_number(text: &str) -> Result<u64, String> {
@@ -744,7 +832,29 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::eps_avg;
     use super::scan_start;
+
+    #[test]
+    fn service_names_resolve_by_return_rva() {
+        assert_eq!(super::service_name(0x009D961A), "Callbacks1");
+        assert_eq!(super::service_name(0x04E5411F), "Records2");
+        assert_eq!(super::service_name(0x04E530A4), "Timing1");
+        assert_eq!(super::service_name(0xDEAD), "unknown");
+        assert_eq!(super::SERVICES.len(), 18);
+        let mut sorted: Vec<u64> = super::SERVICES.iter().map(|(rva, _)| *rva).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 18);
+    }
+
+    #[test]
+    fn average_rate_uses_elapsed_time() {
+        assert_eq!(eps_avg(5000, 20_000), 250);
+        assert_eq!(eps_avg(5000, 0), 0);
+        assert_eq!(eps_avg(0, 500), 0);
+        assert_eq!(eps_avg(1, 3000), 0);
+    }
 
     #[test]
     fn filtered_scan_covers_the_whole_live_ring() {

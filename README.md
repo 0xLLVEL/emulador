@@ -139,11 +139,12 @@ the module attached, stamped on the first hit of that rule with a compare-exchan
 so the earliest thread wins; the stamp comes from the performance counter, so it
 has the same clock and resolution as the event ticks. A boot only reaches the
 stubs its own code path needs, so the idle list is normal and stays visible; the
-idle lines are printed once, in the boot report. The report then repeats every
-15 s for 10 minutes as `svc t=<sec>: ...`, where the tag is the measured elapsed
-time, not a counter guess. That is how a long session timestamps the rules it
-reaches after boot instead of needing a second boot. `new` lines appear in
-whatever report first sees that bit, so a rule that fires later shows up as
+idle lines are printed once, in the boot report. The report then repeats for the
+life of the process as `svc t=<sec>: ...`, where the tag is the measured elapsed
+time, not a counter guess. The cadence starts at 15 s and backs off to 2 minutes,
+so a long session timestamps the rules it reaches after boot without rotating
+`boot.log` with identical lines. `new` lines appear in whatever report first sees
+that bit, so a rule that fires later shows up as
 `svc t=98: svc new 16 Records1 at=95012ms`.
 
 `self` is a self-test that closes the verification gap: for every rule, the
@@ -268,16 +269,22 @@ A shared-memory ring (`Local\RobloxDetLog_<pid>`) records what the client
 probed:
 
 ```
-header 56 B + 4096 slots x 64 B, magic 0x31544544, version 3
+header 56 B + 65536 slots x 64 B (4 MiB), magic 0x31544544, version 3
 per event: source, kind, verdict, caller, rva, tid, four arguments
-header: base, QPC start, QPC last (last accepted record), heat, drop, pid, rate
+header: base, QPC start, QPC last (last accepted record), heat, drop, pid, drop_rate
 heat: weight by verdict and kind, linear decay over 30 s, capped at 100
 dedup: 128-slot open hash, Observed events folded in a 1 s window
-rate: kinds in K_RATE_MASK sampled once per thread per 100 ms
+drop_rate: kinds in K_RATE_MASK sampled once per thread per 100 ms
 files: detlog.jsonl + detlog.1..3, rotated at 64 MiB each
 output: optional JSONL + snapshot next to the DLL
 dacl: owner full, everyone else read-only (D:(A;;GA;;;OW)(A;;GR;;;WD))
 ```
+
+The capacity is deliberately larger than the reference ring. A timing-heavy boot
+fills 4096 slots in 12-22 seconds, which loses the first `DebugCheck` and the
+first `HwidRead` before a reader can attach; 65536 slots covers several minutes
+for 4 MiB of section. The header records `capacity`, and the reader maps the
+section at its real size, so the size is a producer-side constant only.
 
 The section's DACL is explicit: the owner keeps write access, and every other
 process may map the ring read-only. The reader has no reason to write into it,
@@ -337,7 +344,7 @@ Filters narrow the tail without changing the ring: `--kind`, `--src`,
 `--verdict`, `--rva` (accepts `0x`), and `--tid`. A filtered read scans the whole
 live ring and stops after `--count` matches, so a rare event is not hidden behind
 a wall of `TimingProbe`; an unfiltered read prints the last `--count` slots. The
-ring wraps at 4096 records, so an event that scrolled out is gone, filter or not.
+ring wraps at 65536 records, so an event that scrolled out is gone, filter or not.
 `--json` switches both the event lines and the summary to JSON, so the reader can
 feed a script.
 
@@ -345,14 +352,18 @@ The summary also reports `idle=` (QPC now minus the header's `last`, in ms) and
 `heat_now=`. The section's `heat` is only refreshed on the next accepted record,
 so a quiet ring would otherwise show a stale counter; the reader applies the same
 decay the producer would (`heat - heat * idle / 30000`) without writing to the
-section.
+section. `drop_rate=` is the header's dropped-sample counter from the 100 ms
+gate, not events per second; `eps_avg=` is accepted events over elapsed time.
 
 `--audit` walks every slot still present and groups counts, first and last
 sequence by kind, source and verdict. `ServiceStub` records are grouped by their
 return RVA (`a1`), which is the stable identity of a service rule across boots of
-the same client build.
+the same client build, and printed with the rule name (`Callbacks1`,
+`Challenge1`, `Records2`, …). The table lives in the reader and `validate.py`
+cross-checks it against `profile.rs`, so a renamed or moved rule fails the check
+instead of mislabeling the audit.
 
-The ring wraps at 4096 slots, so a reader that trusts every slot can splice two
+The ring wraps at 65536 slots, so a reader that trusts every slot can splice two
 different boots together. Every printed slot is gated on its sequence number: a
 slot whose `seq` is not the one expected was overwritten between the header read
 and the slot read, so it is counted as torn and skipped. Both the tail and

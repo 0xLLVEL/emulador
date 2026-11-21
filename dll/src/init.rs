@@ -494,12 +494,15 @@ extern "system" fn svc_report(_: *mut c_void) -> u32 {
     // A boot only reaches the rules its own path touches. Keep reporting so a
     // long session timestamps the rest instead of needing another boot; the tag
     // carries the elapsed seconds. Only a build with the log sink has anywhere
-    // to put these lines.
+    // to put these lines. The cadence backs off to 2 min so an idle session does
+    // not rotate boot.log with identical lines.
     if detlog::ENABLED {
-        for _ in 1..=40u32 {
-            unsafe { win::Sleep(15_000) };
+        let mut wait = 15_000u32;
+        loop {
+            unsafe { win::Sleep(wait) };
             let seconds = detlog::boot_ms() / 1_000;
             services::coverage_log(&format!("svc t={seconds}"));
+            wait = (wait * 2).min(120_000);
         }
     }
     0

@@ -76,7 +76,12 @@ const _: () = assert!(K_RATE_SLOTS.is_power_of_two());
 
 pub const K_MAGIC: u32 = 0x3154_4544; // 'DET1'
 pub const K_VERSION: u32 = 3;
-pub const K_CAPACITY: u32 = 4096;
+// A timing-heavy boot fills 4096 slots in 12-22 s, which loses the early
+// evidence (`DebugCheck` seq 2, first `HwidRead`) before a reader can attach.
+// 65536 slots is 4 MiB, still cheap for a per-process section, and covers
+// several minutes of a noisy session. The header records it, so the reader
+// stays size-agnostic.
+pub const K_CAPACITY: u32 = 65536;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,6 +171,9 @@ pub struct DetHeader {
     pub heat: u32,
     pub drop: u32,
     pub pid: u32,
+    /// Samples rejected by the per-thread 100 ms gate — not events per second.
+    /// The reader labels it `drop_rate` and derives `eps_avg` from `head` over
+    /// the elapsed QPC time.
     pub rate: u32,
 }
 
@@ -187,7 +195,7 @@ const _: () = assert!(core::mem::offset_of!(DetHeader, last) == 32);
 const _: () = assert!(core::mem::offset_of!(DetHeader, heat) == 40);
 const _: () = assert!(core::mem::offset_of!(DetHeader, drop) == 44);
 const _: () = assert!(core::mem::offset_of!(DetHeader, pid) == 48);
-const _: () = assert!(K_SECTION_SIZE == 56 + 4096 * 64);
+const _: () = assert!(K_SECTION_SIZE == 56 + 65536 * 64);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1297,10 +1305,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<DetEvent>(), 64);
         assert_eq!(core::mem::size_of::<DetHeader>(), 56);
         assert_eq!(core::mem::size_of::<SeenSlot>(), 32);
-        assert_eq!(K_SECTION_SIZE, 262_200);
+        assert_eq!(K_SECTION_SIZE, 4_194_360);
         assert_eq!(K_MAGIC, 0x3154_4544);
         assert_eq!(K_VERSION, 3);
-        assert_eq!(K_CAPACITY, 4096);
+        assert_eq!(K_CAPACITY, 65536);
     }
 
     // The DACL string is the one part of the section open that the kernel can
