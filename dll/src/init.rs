@@ -452,6 +452,9 @@ unsafe extern "system" fn crash_filter(pointers: *mut win::ExceptionPointers) ->
 // release, so the thread is never spawned there.
 extern "system" fn svc_report(_: *mut c_void) -> u32 {
     unsafe { win::Sleep(8000) };
+    // Exercise every rule through the real VEH before reporting. The client
+    // only calls the stubs it needs, so a boot alone leaves rules untested.
+    let (probe, fails) = unsafe { services::self_test() };
     services::coverage_log("boot");
     let (handle, bytes, fail, err) = detlog::det_log_state();
     detlog::trace(&format!(
@@ -464,6 +467,13 @@ extern "system" fn svc_report(_: *mut c_void) -> u32 {
         fail,
         err
     ));
+    if fails != 0 || probe.count_ones() as usize != p::RULES.len() {
+        detlog::trace(&format!(
+            "boot: svc self incomplete rules={} fails={}",
+            probe.count_ones(),
+            fails
+        ));
+    }
     0
 }
 

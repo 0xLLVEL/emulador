@@ -125,10 +125,32 @@ rule:
 
 The VEH is what keeps a missed rule from faulting the process. Each hit sets one
 bit in a coverage mask (one bit per rule, plus a hit counter). A detached thread
-waits 8 s after the hand-off and, when `DEBUG_LOG` is on, writes
-`boot: svc rules=N/18 mask=0x…` plus every rule that never fired. The mask is
-the evidence used to decide whether a rule table has actually been exercised on
-a given client build; it is not assumed.
+waits 8 s after the hand-off and, when `DEBUG_LOG` is on, writes:
+
+```
+boot: svc client=9/18 hits=9 mask=0x00003fc8
+boot: svc self=18/18 mask=0x0003ffff
+boot: svc idle 0 Callbacks1 fault=-7 ret=0x009D961A
+```
+
+`client` is what the running client actually called. A boot only reaches the
+stubs its own code path needs, so the idle list is normal and stays visible.
+
+`self` is a self-test that closes the verification gap: for every rule, the
+emulator fabricates an argument frame on its own stack, installs the rule's real
+return site as the return address, and jumps to the rule's real sentinel. The
+fault travels through the real VEH, matches the real rule, runs the real
+handler, and the client's own stub tail (`48 83 c4 XX ; c3`) returns into a
+trampoline that restores the caller's stack. The probe stack range is tagged, so
+the VEH never confuses probe evidence with client evidence. Handler output is
+checked per service (callback version and pointers, banner text, challenge
+length and nonce, timing monotonicity, zero-length records).
+
+A rule only counts as verified when its return site holds the prologue, the
+tail pops the shadow space, the dispatch matched, and the handler produced the
+expected payload. Any failure is written as `svc self fail <index> <service>`. The
+two masks are reported separately on purpose: the self-test proves the rule
+table, the client mask proves reach per session.
 
 ### 7. Identity hooks (`hooks`, `hwid`)
 
@@ -376,10 +398,11 @@ then appends to `detlog.jsonl`, which grows quickly.
 ## Limits
 
 * Bound to client `0.748.0.7481526` (`2c6fd5e09aaf4cfa`).
-* Service rules are exercised by the client, not by the emulator: a normal boot
-  reaches 9 of the 18 rules on this build. The profile therefore keeps
-  `PROTECTED_SERVICES_VERIFIED` false; the coverage mask from a debug boot is
-  what would justify flipping it.
+* A normal boot reaches 9 of the 18 service rules on its own; the remaining 9
+  are covered by the self-test, which dispatches every rule through the real
+  VEH and validates the handler output. `PROTECTED_SERVICES_VERIFIED` stays
+  `false` because it is emitted from the source header, not from runtime
+  evidence; the two masks in `boot.log` are the evidence.
 * `module.dll` is optional; the boot path does not require it.
 * The SSL debug hook is disabled: its RVA is unknown for this build.
 * The tray patch is not implemented: the replacement bytes are unknown.

@@ -13,7 +13,7 @@ use crate::state;
 use crate::win;
 use core::ptr;
 use core::slice;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // Coverage evidence for the rule table: one bit per RULES index, plus a total
 // hit counter. A rule that never fires keeps its bit clear, which is the
@@ -40,13 +40,18 @@ pub fn coverage_log(tag: &str) {
     let total = p::RULES.len();
     let (mask, hits) = coverage();
     let seen = mask.count_ones() as usize;
+    let probe = PROBE_MASK.load(Ordering::Acquire);
+    let probed = probe.count_ones() as usize;
     crate::detlog::trace(&format!(
-        "{tag}: svc rules={seen}/{total} hits={hits} mask={mask:#010x}"
+        "{tag}: svc client={seen}/{total} hits={hits} mask={mask:#010x}"
+    ));
+    crate::detlog::trace(&format!(
+        "{tag}: svc self={probed}/{total} mask={probe:#010x}"
     ));
     for (index, rule) in p::RULES.iter().enumerate() {
         if mask & (1u32 << index) == 0 {
             crate::detlog::trace(&format!(
-                "{tag}: svc miss {index} {:?} fault={} ret=0x{:08X}",
+                "{tag}: svc idle {index} {:?} fault={} ret=0x{:08X}",
                 rule.service, rule.fault, rule.ret_rva
             ));
         }
@@ -359,6 +364,13 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
         }
 
         let ret_rva = ret - base;
+        // Probe frames live in a self-test allocation; a client fault can
+        // never have its stack pointer inside that range.
+        let probing = {
+            let lo = PROBE_LO.load(Ordering::Acquire);
+            let hi = PROBE_HI.load(Ordering::Acquire);
+            lo != 0 && c.rsp >= lo && c.rsp < hi
+        };
         for (index, rule) in p::RULES.iter().enumerate() {
             if fault != fault_key(rule.fault) || ret_rva != rule.ret_rva as u64 {
                 continue;
@@ -366,9 +378,16 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
             if rule.rcx_required && c.rcx != rule.rcx_match as u64 {
                 continue;
             }
-            mark(index);
+            if probing {
+                PROBE_MASK.fetch_or(1u32 << index, Ordering::AcqRel);
+            } else {
+                mark(index);
+            }
 
             let ok = svc(cx, rule.service);
+            if probing {
+                PROBE_OK.store(ok as u32, Ordering::Release);
+            }
             det(
                 DetSource::Hyperion,
                 DetKind::ServiceStub,
@@ -420,6 +439,214 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
         }
         win::EXCEPTION_CONTINUE_SEARCH
     }
+}
+
+// ---------------------------------------------------------------------------
+// Self-test dispatch
+// ---------------------------------------------------------------------------
+// A boot only reaches the rules the client happens to call. To close that gap
+// the emulator dispatches every rule itself: a fabricated argument frame, the
+// real return site from the profile, the real VEH path, the real handler.
+//
+// Every client stub tail is `eb 05 b8 01 00 00 00 / 48 83 c4 XX / c3`. After
+// the handler the VEH resumes at the return site, the `jmp +5` skips the
+// `mov eax, 1`, and the tail pops its shadow space and returns into
+// `emu_probe_trampoline`, which restores the real stack and returns to Rust.
+//
+// A probe frame is tagged by address range so the VEH can separate probe
+// evidence from client evidence: a real client fault never has its RSP inside
+// this allocation.
+
+static PROBE_MASK: AtomicU32 = AtomicU32::new(0);
+static PROBE_LO: AtomicU64 = AtomicU64::new(0);
+static PROBE_HI: AtomicU64 = AtomicU64::new(0);
+static PROBE_OK: AtomicU32 = AtomicU32::new(0);
+
+const PROBE_FRAME: usize = 0x200;
+const PROBE_ARGS: usize = 0x1000;
+const PROBE_LEN: usize = 0x1800;
+const PROBE_SIZE: usize = 0x2000;
+
+#[repr(C)]
+struct ProbeFrame {
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    rsp: u64,
+    target: u64,
+}
+
+#[unsafe(no_mangle)]
+static emu_probe_saved_rsp: AtomicU64 = AtomicU64::new(0);
+
+core::arch::global_asm!(
+    ".globl emu_probe_dispatch",
+    "emu_probe_dispatch:",
+    "mov qword ptr [rip + emu_probe_saved_rsp], rsp",
+    "mov rax, rcx",
+    "mov rsp, qword ptr [rax + 32]",
+    "mov r9,  qword ptr [rax + 24]",
+    "mov r8,  qword ptr [rax + 16]",
+    "mov rdx, qword ptr [rax + 8]",
+    "mov rcx, qword ptr [rax]",
+    "jmp qword ptr [rax + 40]",
+    ".globl emu_probe_trampoline",
+    "emu_probe_trampoline:",
+    "mov rsp, qword ptr [rip + emu_probe_saved_rsp]",
+    "ret",
+);
+
+unsafe extern "system" {
+    fn emu_probe_dispatch(frame: *const ProbeFrame);
+    fn emu_probe_trampoline();
+}
+
+#[derive(Clone, Copy)]
+enum Expect {
+    Ack,
+    Callbacks,
+    Banner,
+    Challenge,
+    Timing,
+    Records,
+}
+
+fn probe_verified(expect: Expect, args: *mut u8, len_slot: *mut u32) -> bool {
+    unsafe {
+        match expect {
+            Expect::Ack => true,
+            Expect::Callbacks => {
+                read_u32(args as u64) == 2 && read_u64(args as u64 + 8) != 0
+            }
+            Expect::Banner => {
+                &slice::from_raw_parts(args.add(0x20), 9) == b"Copyright"
+            }
+            Expect::Challenge => {
+                ptr::read_unaligned(len_slot) == CHALLENGE_CAP
+                    && slice::from_raw_parts(args, 32).iter().any(|&b| b != 0)
+            }
+            Expect::Timing => {
+                let ds = slice::from_raw_parts(args as *const u64, 8);
+                ds[0] != 0 && ds[1] == ds[2] && ds[3] == ds[4] && ds[1] <= ds[3] && ds[3] <= ds[5]
+            }
+            Expect::Records => ptr::read_unaligned(len_slot) == 0,
+        }
+    }
+}
+
+// Dispatch every rule once. Returns (probe mask, failures). Failures are also
+// written to boot.log with the reason so a bad tail or handler is attributable.
+pub unsafe fn self_test() -> (u32, u32) {
+    let base = state::base() as u64;
+    if base == 0 {
+        return (0, 0);
+    }
+    let region = unsafe {
+        win::VirtualAlloc(
+            ptr::null_mut(),
+            PROBE_SIZE,
+            win::MEM_COMMIT | win::MEM_RESERVE,
+            win::PAGE_READWRITE,
+        )
+    } as *mut u8;
+    if region.is_null() {
+        return (0, 0);
+    }
+    let frame = region;
+    let args = unsafe { region.add(PROBE_ARGS) };
+    let len_slot = unsafe { region.add(PROBE_LEN) } as *mut u32;
+    let mut fails = 0u32;
+
+    for (index, rule) in p::RULES.iter().enumerate() {
+        let ret = base + rule.ret_rva as u64;
+        let tail = unsafe { slice::from_raw_parts((ret + 7) as *const u8, 5) };
+        if tail[..3] != [0x48, 0x83, 0xC4] || tail[4] != 0xC3 {
+            crate::detlog::trace(&format!(
+                "svc self fail {index} {:?} tail={:02X?}",
+                rule.service, tail
+            ));
+            fails += 1;
+            continue;
+        }
+        let epilogue = tail[3] as usize;
+        unsafe {
+            ptr::write_bytes(frame, 0, PROBE_FRAME);
+            ptr::write_bytes(args, 0, 0x400);
+            ptr::write(len_slot, 0xFFFF_FFFF);
+            ptr::write(frame as *mut u64, ret);
+            ptr::write(
+                frame.add(8 + epilogue) as *mut u64,
+                emu_probe_trampoline as *const () as usize as u64,
+            );
+        }
+
+        let mut cx = ProbeFrame {
+            rcx: rule.rcx_match as u64,
+            rdx: 0,
+            r8: 0,
+            r9: 0,
+            rsp: frame as usize as u64,
+            target: rule.fault as i64 as u64,
+        };
+        let mut expect = Expect::Ack;
+        match rule.service {
+            p::Service::Callbacks1
+            | p::Service::Callbacks2
+            | p::Service::Callbacks3
+            | p::Service::Callbacks4
+            | p::Service::Callbacks5
+            | p::Service::Callbacks6 => {
+                cx.rcx = args as u64;
+                cx.rdx = 0x18;
+                expect = Expect::Callbacks;
+            }
+            p::Service::Notice1 => {
+                cx.rcx = args as u64;
+                expect = Expect::Banner;
+            }
+            p::Service::Challenge1 => {
+                cx.r9 = args as u64;
+                unsafe {
+                    ptr::write(frame.add(0x28) as *mut u32, CHALLENGE_CAP);
+                    ptr::write(frame.add(0x30) as *mut u64, len_slot as u64);
+                }
+                expect = Expect::Challenge;
+            }
+            p::Service::Timing1 => {
+                cx.rcx = args as u64;
+                expect = Expect::Timing;
+            }
+            p::Service::Records1 | p::Service::Records2 => {
+                cx.rdx = 0x40;
+                cx.r8 = 0x120;
+                unsafe { ptr::write(frame.add(0x30) as *mut u64, len_slot as u64) };
+                expect = Expect::Records;
+            }
+            _ => {}
+        }
+
+        unsafe {
+            PROBE_LO.store(frame as u64, Ordering::Release);
+            PROBE_HI.store(frame as u64 + PROBE_FRAME as u64, Ordering::Release);
+            PROBE_OK.store(u32::MAX, Ordering::Release);
+            emu_probe_dispatch(&cx as *const ProbeFrame);
+            PROBE_LO.store(0, Ordering::Release);
+            PROBE_HI.store(0, Ordering::Release);
+        }
+
+        let handled = PROBE_OK.load(Ordering::Acquire) == 1;
+        if !handled || !probe_verified(expect, args, len_slot) {
+            crate::detlog::trace(&format!(
+                "svc self fail {index} {:?} handled={handled}",
+                rule.service
+            ));
+            fails += 1;
+        }
+    }
+
+    unsafe { win::VirtualFree(region as *mut core::ffi::c_void, 0, win::MEM_RELEASE) };
+    (PROBE_MASK.load(Ordering::Acquire), fails)
 }
 
 pub unsafe fn install() -> bool {
