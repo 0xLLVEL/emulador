@@ -211,6 +211,11 @@ pub fn module_base() -> *mut u8 {
 // ---------------------------------------------------------------------------
 
 pub type LSTATUS = i32;
+
+pub const ERROR_SUCCESS: LSTATUS = 0;
+pub const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+pub const KEY_READ: DWORD = 0x0002_0019;
+pub const REG_SZ: DWORD = 1;
 pub type NTSTATUS = i32;
 
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32: DWORD = 0x0000_0800;
@@ -335,6 +340,14 @@ unsafe extern "system" {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    pub fn RegOpenKeyExW(
+        key: usize,
+        sub_key: *const u16,
+        options: DWORD,
+        access: DWORD,
+        out: *mut usize,
+    ) -> LSTATUS;
+    pub fn RegCloseKey(key: usize) -> LSTATUS;
     pub fn RegQueryValueExA(
         key: usize,
         value: *const u8,

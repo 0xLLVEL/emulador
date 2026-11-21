@@ -173,6 +173,16 @@ The client fingerprints the machine and the session (`kIdJson`). The emulator:
   stays hex, no leading zero is introduced;
 * rebuilds the trampoline with `cmpxchg16b` so the hook install is atomic.
 
+The seed is derived, not rolled, and it writes nothing to disk. The read is
+`HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`, hashed with FNV-1a over a
+domain tag (`emu-4080-hwid-v1`), folded to 32 bits, never zero. That makes every
+spoofed value — SMBIOS UUID, adapter MAC, registry GUID, identity keys — identical
+across boots of the same machine, and unchanged when a client update renames the
+version folder. A failed registry read falls back to the old `BCryptGenRandom`
+seed so a boot never depends on it; the boot log records which path ran as
+`seed stable` or `seed random`, and `smoke.ps1 -ExpectDebug` fails on the
+fallback.
+
 `hook_out()` restores the original 17 bytes on `DLL_PROCESS_DETACH`.
 
 ### 8. Stealth (`hide_module`, probes)

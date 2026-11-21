@@ -215,10 +215,113 @@ unsafe fn smbios(buf: *mut u8, len: usize) {
     }
 }
 
+const MACHINE_KEY: &str = "SOFTWARE\\Microsoft\\Cryptography";
+const MACHINE_VALUE: &str = "MachineGuid";
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+
+// HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid is created at install and
+// survives every reboot, which is exactly the stability the spoofed IDs need.
+// It is also machine-scoped, not install-scoped: a client update that renames
+// the version folder must not change the identity the server already knows.
+unsafe fn machine_guid() -> Option<Vec<u8>> {
+    let sub_key = wide(MACHINE_KEY);
+    let value = wide(MACHINE_VALUE);
+    let mut key = 0usize;
+    if unsafe {
+        win::RegOpenKeyExW(
+            win::HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            win::KEY_READ,
+            &mut key,
+        )
+    } != win::ERROR_SUCCESS
+    {
+        return None;
+    }
+    let mut size = 0u32;
+    let mut kind = 0u32;
+    let first = unsafe {
+        win::RegQueryValueExW(
+            key,
+            value.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if first != win::ERROR_SUCCESS || size == 0 || size > 512 {
+        unsafe { win::RegCloseKey(key) };
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize + 2];
+    let mut got = size;
+    let second = unsafe {
+        win::RegQueryValueExW(
+            key,
+            value.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            buf.as_mut_ptr(),
+            &mut got,
+        )
+    };
+    unsafe { win::RegCloseKey(key) };
+    if second != win::ERROR_SUCCESS || got == 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    while buf.len() >= 2 && buf[buf.len() - 1] == 0 && buf[buf.len() - 2] == 0 {
+        buf.truncate(buf.len() - 2);
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+// FNV-1a over a domain tag and the machine GUID, folded to 32 bits. The tag
+// keeps this value from ever colliding with a plain hash of MachineGuid that
+// some other tool on the machine might compute.
+fn derive_seed(tag: &[u8], material: &[u8]) -> u32 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in tag.iter().chain(material.iter()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    let mixed = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    let folded = ((mixed ^ (mixed >> 33)) as u32) ^ (hash as u32);
+    if folded == 0 {
+        0x9E37_79B9
+    } else {
+        folded
+    }
+}
+
+/// Seed for every spoofed value, stable across boots of the same machine.
+/// Returns `None` when the machine GUID cannot be read.
+pub fn stable_seed() -> Option<u32> {
+    let guid = unsafe { machine_guid() }?;
+    Some(derive_seed(b"emu-4080-hwid-v1", &guid))
+}
+
 pub fn seed() -> bool {
     if !config::RAND_HWID && !config::RAND_ID {
         return true;
     }
+    if let Some(value) = stable_seed() {
+        state::set_seed(value);
+        crate::detlog::trace("seed stable");
+        return true;
+    }
+    // A failed registry read must not fail a boot. The random fallback is the
+    // old behaviour: still unique, just not stable across launches.
+    crate::detlog::trace("seed random");
     let mut value = 0u32;
     let st = unsafe {
         win::BCryptGenRandom(
@@ -428,5 +531,30 @@ pub fn wrap_import(symbol: &[u8], real: usize) -> Option<usize> {
             Some(reg_get_w as *const () as usize)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_derivation_is_stable_and_mixes_inputs() {
+        let base = derive_seed(b"emu-4080-hwid-v1", b"guid-a");
+        assert_eq!(base, derive_seed(b"emu-4080-hwid-v1", b"guid-a"));
+        assert_ne!(base, derive_seed(b"emu-4080-hwid-v1", b"guid-b"));
+        assert_ne!(base, derive_seed(b"other-tag", b"guid-a"));
+        assert_ne!(base, 0);
+    }
+
+    #[test]
+    fn machine_guid_yields_the_same_seed_every_call() {
+        let Some(first) = stable_seed() else {
+            // No readable MachineGuid (locked-down runner): the fallback is
+            // covered by the boot path, nothing to assert here.
+            return;
+        };
+        assert_ne!(first, 0);
+        assert_eq!(Some(first), stable_seed());
     }
 }
