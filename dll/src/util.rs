@@ -4,18 +4,38 @@ use core::ptr;
 
 const CHUNK: usize = 0x10_0000;
 
-// Copy `src` into `dst` in 1 MiB windows: PAGE_EXECUTE_READWRITE -> memcpy
-// -> FlushInstructionCache -> final protection. Partial installs are restored
-// to the previous protection before returning false.
+// Longest write that stays inside the current committed region. VirtualProtect
+// rejects a range that spans two reservations or touches a free gap, so the
+// copy is clamped to the region VirtualQuery reports. Unknown memory falls
+// back to CHUNK, which keeps the old behaviour for callers outside an image.
+unsafe fn bounded(at: *mut u8, remaining: usize) -> usize {
+    let mut mbi: win::MemoryBasicInformation = unsafe { core::mem::zeroed() };
+    let size = core::mem::size_of::<win::MemoryBasicInformation>();
+    let got = unsafe { win::VirtualQuery(at as *const c_void, &mut mbi, size) };
+    if got != size || mbi.state != win::MEM_COMMIT || mbi.region_size == 0 {
+        return CHUNK.min(remaining);
+    }
+    let start = mbi.base_address as usize;
+    let end = start.saturating_add(mbi.region_size);
+    let here = at as usize;
+    if here < start || here >= end {
+        return CHUNK.min(remaining);
+    }
+    (end - here).min(CHUNK).min(remaining)
+}
+
+// Copy `src` into `dst` in region-bounded windows: PAGE_EXECUTE_READWRITE ->
+// memcpy -> FlushInstructionCache -> final protection. Partial installs are
+// restored to the previous protection before returning false.
 pub unsafe fn wr(dst: *mut u8, src: &[u8], prot: DWORD) -> bool {
     if dst.is_null() || src.is_empty() {
         return false;
     }
     let mut done = 0usize;
     while done < src.len() {
-        let part = CHUNK.min(src.len() - done);
+        let at = unsafe { dst.add(done) };
+        let part = unsafe { bounded(at, src.len() - done) };
         unsafe {
-            let at = dst.add(done);
             let mut old: DWORD = 0;
             if win::VirtualProtect(
                 at as *mut c_void,
@@ -50,9 +70,9 @@ pub unsafe fn wr_zero(dst: *mut u8, len: usize, prot: DWORD) -> bool {
     }
     let mut done = 0usize;
     while done < len {
-        let part = CHUNK.min(len - done);
+        let at = unsafe { dst.add(done) };
+        let part = unsafe { bounded(at, len - done) };
         unsafe {
-            let at = dst.add(done);
             let mut old: DWORD = 0;
             if win::VirtualProtect(
                 at as *mut c_void,

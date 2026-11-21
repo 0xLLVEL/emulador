@@ -1,5 +1,6 @@
-// @generated table of client offsets, imports, gate sites and service rules.
-// Regenerate with `xtask profile` when targeting a different client build.
+// Generated table of client offsets, imports, gate sites and service rules.
+// Pinned to the client build named below; update this table when targeting a
+// different build.
 #![allow(dead_code)]
 
 pub const CLIENT_VERSION: &str = "2c6fd5e09aaf4cfa";
@@ -19,6 +20,14 @@ pub const RUNTIME_VERIFIED: bool = false;
 pub const DECRYPTED_IMAGE_SIZE: u32 = 0x09372000;
 pub const IMAGE_SIZE: u32 = 0x09368000;
 pub const ORIGINAL_ENTRY: u32 = 0x09366004;
+// Raw (pre-restore) image fingerprint. The live EXE ships .text encrypted, so
+// these bytes are only valid before restore() touches the mapping.
+pub const IMAGE_TIMESTAMP: u32 = 0x4F25C703;
+pub const TEXT_HEAD: [u8; 32] = [
+    0xD7, 0xF9, 0x77, 0x81, 0xCC, 0xBB, 0x04, 0x2F, 0x61, 0xE2, 0x97, 0x3A, 0x07, 0x28, 0x5F,
+    0x7D, 0x3F, 0xF1, 0x1E, 0x7E, 0x79, 0xAE, 0xAE, 0x40, 0xF2, 0xF5, 0x42, 0x5B, 0x00, 0x3F,
+    0x4C, 0x72,
+];
 pub const TEXT_RVA: u32 = 0x00001000;
 pub const TEXT_MAP: u32 = 0x06436000;
 pub const PAYLOAD_TEXT: u32 = 0x06436000;

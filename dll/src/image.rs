@@ -6,22 +6,111 @@ use crate::util::{self, wr, wr_zero};
 use crate::win;
 use core::{ptr, slice};
 
-// Sanity check on the host image before touching it: PE32+, size and entry
-// must be the un-restored client values from the profile.
+// Sanity check on the host image before touching it: PE32+, size, entry,
+// timestamp, section shape and the raw .text head must all match the profile.
+// A different client build fails here before a single byte is written.
 pub unsafe fn img(base: *mut u8) -> bool {
-    if base.is_null() {
+    unsafe { img_why(base).is_ok() }
+}
+
+// The live .text section is mapped IMAGE_SCN_MEM_EXECUTE only (characteristics
+// 0x20), so reading it from the mapped image faults. The shipped head is read
+// back from the EXE file at its raw offset instead.
+unsafe fn file_head(raw_offset: u32, out: &mut [u8; 32]) -> bool {
+    let mut path = [0u16; win::MAX_PATH];
+    let n = unsafe {
+        win::GetModuleFileNameW(
+            ptr::null_mut(),
+            path.as_mut_ptr(),
+            win::MAX_PATH as u32,
+        )
+    } as usize;
+    if n == 0 || n >= path.len() {
         return false;
+    }
+    let file = unsafe {
+        win::CreateFileW(
+            path.as_ptr(),
+            win::GENERIC_READ,
+            win::FILE_SHARE_READ | win::FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            win::OPEN_EXISTING,
+            win::FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if file == win::INVALID_HANDLE_VALUE || file.is_null() {
+        return false;
+    }
+    let mut moved: i64 = 0;
+    let mut got: u32 = 0;
+    let ok = unsafe {
+        win::SetFilePointerEx(file, raw_offset as i64, &mut moved, win::FILE_BEGIN) != 0
+            && win::ReadFile(
+                file,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                &mut got,
+                ptr::null_mut(),
+            ) != 0
+            && got == out.len() as u32
+    };
+    unsafe { win::CloseHandle(file) };
+    ok
+}
+
+// Same guard, with the failing invariant named so DllMain can log it instead
+// of a bare "FAIL img".
+pub unsafe fn img_why(base: *mut u8) -> Result<(), &'static str> {
+    if base.is_null() {
+        return Err("null base");
     }
     unsafe {
         let dos = base as *const win::ImageDosHeader;
         if (*dos).e_magic != win::IMAGE_DOS_SIGNATURE || (*dos).e_lfanew <= 0 {
-            return false;
+            return Err("dos header");
         }
         let nt = win::nt_headers(base);
-        (*nt).signature == win::IMAGE_NT_SIGNATURE
-            && (*nt).optional_header.magic == win::IMAGE_NT_OPTIONAL_HDR64_MAGIC
-            && (*nt).optional_header.size_of_image == p::IMAGE_SIZE
-            && (*nt).optional_header.address_of_entry_point == p::ORIGINAL_ENTRY
+        if (*nt).signature != win::IMAGE_NT_SIGNATURE {
+            return Err("nt signature");
+        }
+        if (*nt).optional_header.magic != win::IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            return Err("pe32+ magic");
+        }
+        if (*nt).optional_header.size_of_image != p::IMAGE_SIZE {
+            return Err("size of image");
+        }
+        if (*nt).optional_header.address_of_entry_point != p::ORIGINAL_ENTRY {
+            return Err("entry point");
+        }
+        if (*nt).file_header.time_date_stamp != p::IMAGE_TIMESTAMP {
+            return Err("timestamp");
+        }
+
+        let mut text: *const win::ImageSectionHeader = ptr::null();
+        let mut sh = win::section_headers(base);
+        for _ in 0..(*nt).file_header.number_of_sections {
+            if win::section_name(sh) == b".text" {
+                text = sh;
+                break;
+            }
+            sh = sh.add(1);
+        }
+        if text.is_null() {
+            return Err(".text missing");
+        }
+        if (*text).virtual_address != p::TEXT_RVA || (*text).virtual_size != p::TEXT_VSIZE {
+            return Err(".text shape");
+        }
+
+        let mut head = [0u8; 32];
+        if !file_head((*text).pointer_to_raw_data, &mut head) {
+            return Err(".text head read");
+        }
+        if head != p::TEXT_HEAD {
+            return Err(".text head");
+        }
+        Ok(())
     }
 }
 
@@ -399,23 +488,68 @@ mod tests {
     #[test]
     fn img_checks_live_header_shape() {
         unsafe {
-            let mem = alloc(0x1000);
+            let mem = alloc(0x3000);
+            ptr::write_bytes(mem, 0, 0x3000);
             let dos = mem as *mut win::ImageDosHeader;
             (*dos).e_magic = win::IMAGE_DOS_SIGNATURE;
             (*dos).e_lfanew = 0x40;
             let nt = win::nt_headers(mem);
             (*nt).signature = win::IMAGE_NT_SIGNATURE;
+            (*nt).file_header.number_of_sections = 1;
+            (*nt).file_header.time_date_stamp = p::IMAGE_TIMESTAMP;
             (*nt).optional_header.magic = win::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
             (*nt).optional_header.size_of_image = p::IMAGE_SIZE;
             (*nt).optional_header.address_of_entry_point = p::ORIGINAL_ENTRY;
-            assert!(img(mem));
+            let sh = win::section_headers(mem);
+            let name = core::ptr::addr_of_mut!((*sh).name) as *mut u8;
+            ptr::copy_nonoverlapping(b".text".as_ptr(), name, 5);
+            (*sh).virtual_address = p::TEXT_RVA;
+            (*sh).virtual_size = p::TEXT_VSIZE;
+
+            // A synthetic image can satisfy every header invariant, but the
+            // head is read back from the running EXE, so it cannot match.
+            assert_eq!(img_why(mem), Err(".text head"));
+
             (*nt).optional_header.size_of_image += 0x1000;
-            assert!(!img(mem));
+            assert_eq!(img_why(mem), Err("size of image"));
             (*nt).optional_header.size_of_image = p::IMAGE_SIZE;
-            assert!(img(mem));
+
             (*nt).optional_header.address_of_entry_point = p::RESTORED_ENTRY;
-            assert!(!img(mem));
+            assert_eq!(img_why(mem), Err("entry point"));
+            (*nt).optional_header.address_of_entry_point = p::ORIGINAL_ENTRY;
+
+            (*nt).file_header.time_date_stamp ^= 1;
+            assert_eq!(img_why(mem), Err("timestamp"));
+            (*nt).file_header.time_date_stamp = p::IMAGE_TIMESTAMP;
+
+            (*sh).virtual_size ^= 0x100;
+            assert_eq!(img_why(mem), Err(".text shape"));
+            (*sh).virtual_size = p::TEXT_VSIZE;
+
+            (*nt).optional_header.magic = 0x10B;
+            assert_eq!(img_why(mem), Err("pe32+ magic"));
             free(mem);
+        }
+    }
+
+    #[test]
+    fn file_head_reads_the_running_exe() {
+        unsafe {
+            let base = win::GetModuleHandleW(ptr::null()) as *mut u8;
+            let nt = win::nt_headers(base);
+            let mut sh = win::section_headers(base);
+            let mut raw = None;
+            for _ in 0..(*nt).file_header.number_of_sections {
+                if win::section_name(sh) == b".text" {
+                    raw = Some((*sh).pointer_to_raw_data);
+                    break;
+                }
+                sh = sh.add(1);
+            }
+            let raw = raw.expect(".text in the test harness");
+            let mut head = [0u8; 32];
+            assert!(file_head(raw, &mut head));
+            assert_ne!(head, [0u8; 32]);
         }
     }
 

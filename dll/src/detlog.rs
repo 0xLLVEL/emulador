@@ -719,6 +719,17 @@ pub fn trace(text: &str) {
     unsafe { write_trace(state::dir(), text.as_bytes()) }
 }
 
+// Unconditional boot.log line for fatal paths (panic, crash filter). Runs even
+// in release, where trace() is compiled out. Before init() knows the module
+// directory the line lands in %TEMP%\emu_boot.log instead of being lost.
+pub fn fatal(text: &str) {
+    if state::dir().is_empty() {
+        unsafe { write_temp_trace(text.as_bytes()) }
+        return;
+    }
+    unsafe { write_trace(state::dir(), text.as_bytes()) }
+}
+
 pub fn trace_bytes(text: &[u8]) {
     if !ENABLED {
         return;
@@ -734,6 +745,31 @@ pub unsafe fn write_trace(dir: &[u16], text: &[u8]) {
     }
     let mut path = WideBuf::<{ win::MAX_PATH }>::new();
     if !path.push_slice(dir) || !path.push_ascii("\\boot.log") {
+        return;
+    }
+    let handle = create_append(path.as_ptr());
+    if handle == win::INVALID_HANDLE_VALUE || handle.is_null() {
+        return;
+    }
+    write_file(handle, text.as_ptr(), text.len());
+    write_file(handle, b"\r\n".as_ptr(), 2);
+    unsafe { win::CloseHandle(handle) };
+}
+
+// Same append path rooted in %TEMP%, for failures before init() knows the
+// module directory. Only fatal() reaches this.
+pub unsafe fn write_temp_trace(text: &[u8]) {
+    let mut buf = [0u16; win::MAX_PATH];
+    let len = unsafe { win::GetTempPathW(win::MAX_PATH as u32, buf.as_mut_ptr()) } as usize;
+    if len == 0 || len >= buf.len() {
+        return;
+    }
+    let mut cut = len;
+    while cut > 0 && buf[cut - 1] == b'\\' as u16 {
+        cut -= 1;
+    }
+    let mut path = WideBuf::<{ win::MAX_PATH }>::new();
+    if !path.push_slice(&buf[..cut]) || !path.push_ascii("\\emu_boot.log") {
         return;
     }
     let handle = create_append(path.as_ptr());

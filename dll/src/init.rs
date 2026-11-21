@@ -219,10 +219,17 @@ fn set_dir_from_module() -> bool {
     true
 }
 
+// Record the first failing stage and report it from entry().
+fn fail(msg: &str, code: u32) -> bool {
+    trace(msg);
+    state::set_fail(code);
+    false
+}
+
 pub unsafe fn init() -> bool {
     if !set_dir_from_module() {
-        trace("FAIL dir");
-        return false;
+        detlog::fatal("FAIL dir resolve");
+        return fail("FAIL dir", 0xE001);
     }
     // boot.log lives next to the image, so the very first line can only be
     // written once the directory is known.
@@ -239,47 +246,38 @@ pub unsafe fn init() -> bool {
     detlog::det_init();
 
     if !unsafe { image::img(base) } {
-        trace("FAIL img");
-        return false;
+        return fail("FAIL img", 0xE002);
     }
     trace("ok img");
     if !hwid::seed() {
-        trace("FAIL seed");
-        return false;
+        return fail("FAIL seed", 0xE003);
     }
     trace("ok seed");
     let Some(payload) = image::payload() else {
-        trace("FAIL payload");
-        return false;
+        return fail("FAIL payload", 0xE004);
     };
     trace("ok payload");
     if !unsafe { image::restore(base, &payload) } {
-        trace("FAIL restore");
-        return false;
+        return fail("FAIL restore", 0xE005);
     }
     trace("ok restore");
     drop(payload);
     if !unsafe { image::sec(base) } {
-        trace("FAIL sec");
-        return false;
+        return fail("FAIL sec", 0xE006);
     }
     trace("ok sec");
     if !unsafe { image::imp(base) } {
-        trace("FAIL imp");
-        return false;
+        return fail("FAIL imp", 0xE007);
     }
     trace("ok imp");
     if !unsafe { image::proxy(base) } {
-        trace("FAIL proxy");
-        return false;
+        return fail("FAIL proxy", 0xE008);
     }
     if !unsafe { image::png(base) } {
-        trace("FAIL png");
-        return false;
+        return fail("FAIL png", 0xE009);
     }
     if !unsafe { image::lua(base) } {
-        trace("FAIL lua");
-        return false;
+        return fail("FAIL lua", 0xE00A);
     }
     trace("ok lua");
 
@@ -315,14 +313,12 @@ pub unsafe fn init() -> bool {
         || object_len == 0
         || object_len > 1024
     {
-        trace("FAIL bcrypt");
-        return false;
+        return fail("FAIL bcrypt", 0xE00B);
     }
     state::set_hash(alg, object_len);
 
     let Some(token) = image::token() else {
-        trace("FAIL token");
-        return false;
+        return fail("FAIL token", 0xE00C);
     };
     // kMux write stays disabled: the profile RVA lands in shifted .data for
     // this build and would clobber an unrelated client global.
@@ -330,12 +326,10 @@ pub unsafe fn init() -> bool {
 
     let table = unsafe { base.add(p::UNWIND_RVA as usize) };
     if unsafe { win::RtlAddFunctionTable(table as *mut c_void, p::UNWIND_COUNT, base as u64) } == 0 {
-        trace("FAIL unwind");
-        return false;
+        return fail("FAIL unwind", 0xE00D);
     }
     if !unsafe { ep_a(entry as *const c_void) } {
-        trace("FAIL ep_a");
-        return false;
+        return fail("FAIL ep_a", 0xE00E);
     }
     detlog::det_snapshot();
     true
@@ -383,6 +377,9 @@ pub unsafe fn prep() -> bool {
         hide_module(state::this_module() as win::HMODULE);
     }
 
+    unsafe { win::SetUnhandledExceptionFilter(crash_filter as *mut c_void) };
+    spawn_svc_report();
+
     if config::LOAD_MODULE {
         let thread = unsafe {
             win::CreateThread(
@@ -399,6 +396,83 @@ pub unsafe fn prep() -> bool {
         }
     }
     true
+}
+
+// ----------------------
+// crash attribution
+// ----------------------
+
+// One-shot guard: a fault inside the filter itself must not recurse.
+static CRASH_SEEN: AtomicI32 = AtomicI32::new(0);
+
+// No SEH in stable Rust, so an access violation in the client entry kills the
+// process with no trace. The filter records the faulting instruction RVA and
+// the containing memory region in boot.log, then lets the process terminate.
+unsafe extern "system" fn crash_filter(pointers: *mut win::ExceptionPointers) -> i32 {
+    if pointers.is_null() || CRASH_SEEN.swap(1, Ordering::AcqRel) != 0 {
+        return win::EXCEPTION_EXECUTE_HANDLER;
+    }
+    unsafe {
+        let ep = &*pointers;
+        if ep.exception_record.is_null() || ep.context_record.is_null() {
+            detlog::fatal("crash: missing records");
+            return win::EXCEPTION_EXECUTE_HANDLER;
+        }
+        let rec = &*ep.exception_record;
+        let cx = &*ep.context_record;
+        let base = state::base() as u64;
+        let rip = cx.rip;
+        let rva = rip.wrapping_sub(base);
+
+        let mut mbi: win::MemoryBasicInformation = core::mem::zeroed();
+        let size = core::mem::size_of::<win::MemoryBasicInformation>();
+        let known = win::VirtualQuery(rip as *const c_void, &mut mbi, size) == size;
+        if known {
+            detlog::fatal(&format!(
+                "crash code={:#010X} rip={:#018x} rva={:#x} region={:p} protect={:#x} state={:#x}",
+                rec.code, rip, rva, mbi.base_address, mbi.protect, mbi.state
+            ));
+        } else {
+            detlog::fatal(&format!(
+                "crash code={:#010X} rip={:#018x} rva={:#x} region=unknown",
+                rec.code, rip, rva
+            ));
+        }
+    }
+    win::EXCEPTION_EXECUTE_HANDLER
+}
+
+// ----------------------
+// service coverage report
+// ----------------------
+
+// Rules only fire once the client boots, which happens after entry() hands
+// control over, so the report cannot run inside init(). A detached thread
+// waits for the boot to settle and dumps the mask. trace() is compiled out in
+// release, so the thread is never spawned there.
+extern "system" fn svc_report(_: *mut c_void) -> u32 {
+    unsafe { win::Sleep(8000) };
+    services::coverage_log("boot");
+    0
+}
+
+fn spawn_svc_report() {
+    if !detlog::ENABLED {
+        return;
+    }
+    let thread = unsafe {
+        win::CreateThread(
+            ptr::null_mut(),
+            0,
+            svc_report,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if !thread.is_null() {
+        unsafe { win::CloseHandle(thread) };
+    }
 }
 
 pub unsafe fn ep() -> bool {
@@ -451,12 +525,14 @@ pub extern "system" fn entry() -> u32 {
         trace("entry");
         if !prep() {
             trace("FAIL prep");
-            return win::ERROR_DLL_INIT_FAILED;
+            state::set_fail(0xE00F);
+            return state::fail();
         }
         trace("ok prep");
         if !ep() {
             trace("FAIL ep");
-            return win::ERROR_DLL_INIT_FAILED;
+            state::set_fail(0xE010);
+            return state::fail();
         }
         trace("ok ep");
         let base = state::base();

@@ -173,7 +173,13 @@ pub unsafe fn section_name(section: *const ImageSectionHeader) -> &'static [u8] 
 unsafe extern "system" {
     pub fn VirtualAlloc(addr: *mut c_void, size: usize, kind: DWORD, prot: DWORD) -> *mut c_void;
     pub fn VirtualProtect(addr: *mut c_void, size: usize, prot: DWORD, old: *mut DWORD) -> BOOL;
+    pub fn VirtualQuery(
+        addr: *const c_void,
+        info: *mut MemoryBasicInformation,
+        size: usize,
+    ) -> usize;
     pub fn VirtualFree(addr: *mut c_void, size: usize, kind: DWORD) -> BOOL;
+    pub fn SetUnhandledExceptionFilter(filter: *mut c_void) -> *mut c_void;
     pub fn FlushInstructionCache(process: HANDLE, addr: *const c_void, size: usize) -> BOOL;
     pub fn GetCurrentProcess() -> HANDLE;
     pub fn GetModuleHandleW(name: *const u16) -> HMODULE;
@@ -439,6 +445,7 @@ unsafe extern "system" {
 pub const DLL_THREAD_ATTACH: DWORD = 2;
 pub const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+pub const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
 pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 pub const ERROR_DLL_INIT_FAILED: u32 = 1114;
 pub const BCRYPT_OBJECT_LENGTH: &[u16] = &[
@@ -550,10 +557,13 @@ unsafe extern "system" {
 // ---------------------------------------------------------------------------
 
 pub const MAX_PATH: usize = 260;
+pub const GENERIC_READ: DWORD = 0x8000_0000;
 pub const FILE_APPEND_DATA: DWORD = 0x0000_0004;
 pub const FILE_SHARE_READ: DWORD = 0x0000_0001;
 pub const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
+pub const OPEN_EXISTING: DWORD = 3;
 pub const OPEN_ALWAYS: DWORD = 4;
+pub const FILE_BEGIN: DWORD = 0;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
 pub const FILE_MAP_ALL_ACCESS: DWORD = 0x000F_001F;
 
@@ -589,6 +599,19 @@ unsafe extern "system" {
         len: DWORD,
         written: *mut DWORD,
         overlapped: *mut c_void,
+    ) -> BOOL;
+    pub fn ReadFile(
+        file: HANDLE,
+        buf: *mut u8,
+        len: DWORD,
+        read: *mut DWORD,
+        overlapped: *mut c_void,
+    ) -> BOOL;
+    pub fn SetFilePointerEx(
+        file: HANDLE,
+        distance: i64,
+        new_ptr: *mut i64,
+        method: DWORD,
     ) -> BOOL;
     pub fn GetTempPathW(len: DWORD, buf: *mut u16) -> DWORD;
     pub fn CreateFileMappingW(

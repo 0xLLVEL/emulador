@@ -42,14 +42,20 @@ not directly executable. The emulator carries the original decrypted code as a
 Brotli-compressed RCDATA resource (`IDR_PAYLOAD`) inside the DLL.
 
 ```
-img()      validate DOS/NT headers, entry point, section table
+img()      fingerprint the host before touching it: DOS/NT headers, PE32+,
+           SizeOfImage, entry point, PE TimeDateStamp, .text VA/VSIZE and the
+           raw .text head read back from the EXE file (the live .text is mapped
+           execute-only, so reading the mapping would fault)
 restore()  decompress the payload, copy .text over TEXT_RVA/TEXT_VSIZE,
            zero TEXT_PAD, copy the unwind table over UNWIND_RVA
 sec()      set section characteristics: .text/.tempest -> code+execute+read
 ```
 
-Every copy is written through `VirtualProtect` + `FlushInstructionCache`, in
-1 MiB windows, and partial failures restore the previous protection.
+Every copy goes through `VirtualProtect` + `FlushInstructionCache`. Each window
+is clamped to the current `VirtualQuery` region, so a write never spans two
+reservations; partial failures restore the previous protection. A host that
+fails any fingerprint check is rejected before a single byte is written, and
+`img_why()` names the invariant that failed.
 
 ### 3. Import table (`imp`)
 
@@ -99,6 +105,12 @@ client continues into its normal entry code instead of returning into a stale
 stub. The stack rewrite is best-effort — an entry thread started by the loader
 normally has no matching slot, and that is not a failure.
 
+Stable Rust has no SEH, so `prep()` also installs an unhandled-exception filter
+before control moves into the client entry. A fault after the hand-off logs the
+exception code, RIP, RVA and the containing region (base/protect/state) to
+`boot.log`, then terminates. Every boot stage reports a distinct failure code:
+`0xE001`–`0xE00E` for `init()`, `0xE00F`/`0xE010` for `prep()`/`ep()`.
+
 ### 6. Vectored exception handler and service rules (`services`)
 
 Hyperion validates a set of protected services at boot. `services::install()`
@@ -111,7 +123,12 @@ rule:
 * unknown service callbacks and impossible timing are recorded by the
   detection sink (`DetKind::ServiceMiss`, `TimingProbe`).
 
-The VEH is what keeps a missed rule from faulting the process.
+The VEH is what keeps a missed rule from faulting the process. Each hit sets one
+bit in a coverage mask (one bit per rule, plus a hit counter). A detached thread
+waits 8 s after the hand-off and, when `DEBUG_LOG` is on, writes
+`boot: svc rules=N/18 mask=0x…` plus every rule that never fired. The mask is
+the evidence used to decide whether a rule table has actually been exercised on
+a given client build; it is not assumed.
 
 ### 7. Identity hooks (`hooks`, `hwid`)
 
@@ -160,11 +177,16 @@ output: optional JSONL + snapshot next to the DLL
 The sink is compiled out unless `config::DEBUG_LOG` is `true`; the release
 build keeps it `false` so nothing is written.
 
+Boot-critical failures do not depend on that switch: `detlog::fatal()` writes to
+`boot.log` even in release, and falls back to `%TEMP%\emu_boot.log` when the
+module directory is not known yet. The panic hook, the image guard, every init
+stage and the crash filter all go through it.
+
 ### 10. Boot sequence
 
 ```
 DllMain
-  img
+  img guard (img_why)
   init
     dir -> attach
     img
@@ -185,7 +207,9 @@ entry
     png / lua / hook_in
     services + VEH
     hide self
+    crash filter
     lod thread (5 s delay)
+    coverage report thread (8 s delay, debug only)
   ep
   client entry at RESTORED_ENTRY
 ```
@@ -286,17 +310,19 @@ cargo test --release
 
 Tests cover payload decoding, image restore against a manually mapped image,
 import resolution, gate patches, the detection ring (layout, weights, decay,
-dedup, JSONL), the identity tables, the probe filters and the entry-patch
-return contract.
-
-Four tests need local fixtures (decrypted image, raw payload, compressed
-payload). Point `EMU_FIXTURES` at a folder containing them to enable those
-tests; otherwise they return early:
+dedup, JSONL), the identity tables, the probe filters, the image fingerprint,
+the file-backed `.text` head reader and the entry-patch return contract.
+Fixtures (decrypted image, raw payload, compressed payload) are optional: point
+`EMU_FIXTURES` at a folder containing them to enable the four fixture tests,
+otherwise they return early:
 
 ```powershell
 $env:EMU_FIXTURES = "C:\path\to\fixtures"
 cargo test --release
 ```
+
+Run `python tools/validate.py` in the private workspace to compare the profile
+table, patch sites and guards against the actual client bytes.
 
 ---
 
@@ -323,6 +349,10 @@ then appends to `detlog.jsonl`, which grows quickly.
 ## Limits
 
 * Bound to client `0.748.0.7481526` (`2c6fd5e09aaf4cfa`).
+* Service rules are exercised by the client, not by the emulator: a normal boot
+  reaches 9 of the 18 rules on this build. The profile therefore keeps
+  `PROTECTED_SERVICES_VERIFIED` false; the coverage mask from a debug boot is
+  what would justify flipping it.
 * `module.dll` is optional; the boot path does not require it.
 * The SSL debug hook is disabled: its RVA is unknown for this build.
 * The tray patch is not implemented: the replacement bytes are unknown.

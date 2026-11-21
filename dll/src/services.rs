@@ -13,6 +13,50 @@ use crate::state;
 use crate::win;
 use core::ptr;
 use core::slice;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// Coverage evidence for the rule table: one bit per RULES index, plus a total
+// hit counter. A rule that never fires keeps its bit clear, which is the
+// evidence needed before PROTECTED_SERVICES_VERIFIED can be flipped.
+static COVERAGE_MASK: AtomicU32 = AtomicU32::new(0);
+static COVERAGE_HITS: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn mark(index: usize) {
+    COVERAGE_MASK.fetch_or(1u32 << index, Ordering::AcqRel);
+    COVERAGE_HITS.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn coverage() -> (u32, u32) {
+    (
+        COVERAGE_MASK.load(Ordering::Acquire),
+        COVERAGE_HITS.load(Ordering::Acquire),
+    )
+}
+
+// Dumps the mask and every rule that never fired. Debug builds write this to
+// boot.log; release compiles trace() out, so it costs one sleeping thread.
+pub fn coverage_log(tag: &str) {
+    let total = p::RULES.len();
+    let (mask, hits) = coverage();
+    let seen = mask.count_ones() as usize;
+    crate::detlog::trace(&format!(
+        "{tag}: svc rules={seen}/{total} hits={hits} mask={mask:#010x}"
+    ));
+    for (index, rule) in p::RULES.iter().enumerate() {
+        if mask & (1u32 << index) == 0 {
+            crate::detlog::trace(&format!(
+                "{tag}: svc miss {index} {:?} fault={} ret=0x{:08X}",
+                rule.service, rule.fault, rule.ret_rva
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn coverage_mask() -> u32 {
+    COVERAGE_MASK.load(Ordering::Acquire)
+}
 
 pub const CHALLENGE_CAP: u32 = 0xC0;
 pub const BANNER_LEN: usize = 0x13D;
@@ -315,13 +359,14 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
         }
 
         let ret_rva = ret - base;
-        for rule in p::RULES.iter() {
+        for (index, rule) in p::RULES.iter().enumerate() {
             if fault != fault_key(rule.fault) || ret_rva != rule.ret_rva as u64 {
                 continue;
             }
             if rule.rcx_required && c.rcx != rule.rcx_match as u64 {
                 continue;
             }
+            mark(index);
 
             let ok = svc(cx, rule.service);
             det(
@@ -378,6 +423,10 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
 }
 
 pub unsafe fn install() -> bool {
+    // The coverage bitmask is one u32; refuse a profile that outgrows it.
+    if p::RULES.len() > u32::BITS as usize {
+        return false;
+    }
     if !state::veh().is_null() {
         return true;
     }
@@ -764,5 +813,31 @@ mod tests {
         assert!(p::TEXT_MAP > p::TEXT_RVA);
         assert!(p::ORIGINAL_ENTRY > p::TEXT_RVA);
         assert!(p::RESTORED_ENTRY > p::TEXT_RVA && p::RESTORED_ENTRY < p::TEXT_MAP);
+    }
+
+    #[test]
+    fn rule_hit_marks_its_coverage_bit() {
+        let region = alloc(0x10_000);
+        unsafe {
+            let index = p::RULES
+                .iter()
+                .position(|r| r.service == p::Service::Acknowledge1)
+                .expect("rule present");
+            let rule = &p::RULES[index];
+            let stack = alloc(0x1000) as *mut u64;
+            let mut cx = zeroed_context();
+            let status = run_veh(
+                rule.fault as i64 as u64,
+                rule.ret_rva as u64,
+                region.add(0x3000),
+                stack,
+                &mut cx,
+            );
+            assert_eq!(status, win::EXCEPTION_CONTINUE_EXECUTION);
+            assert_ne!(coverage_mask() & (1u32 << index), 0);
+            assert!(coverage().1 >= 1);
+            free(stack as *mut u8);
+        }
+        free(region);
     }
 }

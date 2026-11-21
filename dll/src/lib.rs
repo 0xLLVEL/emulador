@@ -36,17 +36,25 @@ extern "system" fn DllMain(instance: *mut c_void, reason: u32, _reserved: *mut c
     match reason {
         win::DLL_PROCESS_ATTACH => {
             state::set_self(instance);
+            std::panic::set_hook(Box::new(|info| {
+                detlog::fatal(&format!("panic: {info}"));
+            }));
             unsafe {
                 win::DisableThreadLibraryCalls(instance);
                 let base = win::GetModuleHandleW(core::ptr::null()) as *mut u8;
                 if base.is_null() {
+                    state::set_fail(0xE000_0001);
+                    detlog::fatal("FAIL no exe base");
                     return 0;
                 }
                 state::set_base(base);
-                if !image::img(base) {
+                if let Err(why) = image::img_why(base) {
+                    state::set_fail(0xE000_0002);
+                    detlog::fatal(&format!("FAIL img guard: {why}"));
                     return 0;
                 }
                 if !init::init() {
+                    detlog::fatal(&format!("FAIL init 0x{:08X}", state::fail()));
                     return 0;
                 }
                 detlog::trace("attach ok");

@@ -17,6 +17,7 @@ static T1: AtomicI64 = AtomicI64::new(0);
 static HASH: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static HASH_OBJ: AtomicU32 = AtomicU32::new(0);
 static VEH: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static FAIL_CODE: AtomicU32 = AtomicU32::new(0);
 static DIR_LEN: AtomicUsize = AtomicUsize::new(0);
 static mut DIR: [u16; 260] = [0; 260];
 
@@ -120,6 +121,15 @@ pub fn set_veh(handle: *mut c_void) {
 
 pub fn veh() -> *mut c_void {
     VEH.load(Ordering::Acquire)
+}
+
+// First failing boot stage wins; entry() reports it when prep/ep abort.
+pub fn set_fail(code: u32) {
+    let _ = FAIL_CODE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+}
+
+pub fn fail() -> u32 {
+    FAIL_CODE.load(Ordering::Acquire)
 }
 
 pub fn set_dir(dir: &[u16]) {
