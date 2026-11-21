@@ -380,6 +380,14 @@ pub unsafe fn prep() -> bool {
         detlog::trace("nt fail");
     }
 
+    // Same idea for the HWID surface: only DeviceIoControl is in the client
+    // IAT, so that is the install that can be checked from the image.
+    if unsafe { crate::hwid::selftest(base) } {
+        detlog::trace("hwid ioctl ok");
+    } else {
+        detlog::trace("hwid ioctl fail");
+    }
+
     // Hide this DLL from the loader lists now, rather than relying on the
     // delayed module.dll load (which is absent in many client installs).
     if config::STEALTH {

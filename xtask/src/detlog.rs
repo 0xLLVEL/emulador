@@ -271,6 +271,14 @@ struct Filter {
 }
 
 impl Filter {
+    fn any(&self) -> bool {
+        self.kind.is_some()
+            || self.source.is_some()
+            || self.verdict.is_some()
+            || self.rva.is_some()
+            || self.tid.is_some()
+    }
+
     fn accepts(&self, entry: &Event, base: u64) -> bool {
         if let Some(kind) = self.kind {
             if entry.kind != kind {
@@ -374,9 +382,22 @@ fn summary(hdr: &Header, freq: u64, torn: u64, json: bool) {
 // A sequence that is not the expected one means a slot was overwritten between
 // the copy of head we hold and the copy of the slot, so the slot is reported
 // and skipped rather than printed as if it were the next event.
+fn scan_start(head: u32, capacity: u32, count: u32, any: bool) -> u32 {
+    if any {
+        head.saturating_sub(head.min(capacity))
+    } else {
+        head.saturating_sub(count)
+            .max(head.saturating_sub(capacity))
+    }
+}
+
 fn tail(view: *const u8, hdr: &Header, filter: &Filter, count: u32, freq: u64, json: bool) -> (u32, u64) {
     let capacity = hdr.capacity.max(1);
-    let first = hdr.head.saturating_sub(count).max(hdr.head.saturating_sub(capacity));
+    // A filter selects events, so the window has to cover the whole live ring:
+    // `--count` caps what is printed, not how far back the reader looks.
+    // Without a filter, the window is exactly the last `count` slots.
+    let first = scan_start(hdr.head, capacity, count, filter.any());
+    let mut printed = 0u32;
     let mut torn = 0u64;
     let mut expected = first;
     while expected != hdr.head {
@@ -385,6 +406,10 @@ fn tail(view: *const u8, hdr: &Header, filter: &Filter, count: u32, freq: u64, j
             torn += 1;
         } else if filter.accepts(&entry, hdr.base) {
             print_event(&entry, hdr.base, hdr.start, freq, json);
+            printed += 1;
+            if filter.any() && printed >= count {
+                break;
+            }
         }
         expected = expected.wrapping_add(1);
     }
@@ -715,4 +740,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
         CloseHandle(armed);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_start;
+
+    #[test]
+    fn filtered_scan_covers_the_whole_live_ring() {
+        assert_eq!(scan_start(5000, 4096, 10, true), 904);
+        assert_eq!(scan_start(300, 4096, 10, true), 0);
+    }
+
+    #[test]
+    fn unfiltered_scan_is_the_last_count_slots() {
+        assert_eq!(scan_start(5000, 4096, 10, false), 4990);
+        assert_eq!(scan_start(40, 4096, 10, false), 30);
+        assert_eq!(scan_start(5000, 4096, 9000, false), 904);
+    }
+
+    #[test]
+    fn empty_ring_starts_at_zero() {
+        assert_eq!(scan_start(0, 4096, 10, true), 0);
+        assert_eq!(scan_start(0, 4096, 10, false), 0);
+    }
 }

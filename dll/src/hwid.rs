@@ -24,10 +24,37 @@ type AdaptersFn = unsafe extern "system" fn(
     *mut win::IpAdapterAddresses,
     *mut u32,
 ) -> u32;
+type VolInfoFn = unsafe extern "system" fn(
+    *const u16,
+    *mut u16,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut u32,
+    *mut u16,
+    u32,
+) -> i32;
+type DeviceIoFn = unsafe extern "system" fn(
+    win::HANDLE,
+    u32,
+    *mut c_void,
+    u32,
+    *mut c_void,
+    u32,
+    *mut u32,
+    *mut c_void,
+) -> i32;
+type CompNameFn = unsafe extern "system" fn(*mut u16, *mut u32) -> i32;
+type SetupIdFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u16, u32, *mut u32) -> i32;
 
 static REG_QEXA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REG_QEXW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REG_GETW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static VOL_INFO: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static DEVICE_IO: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static COMP_NAME: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static SETUP_ID: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 const SALT_GUID: u32 = 0x4D47_5549;
 
@@ -349,9 +376,9 @@ unsafe extern "system" fn firmware(provider: u32, id: u32, buf: *mut c_void, len
         DetKind::HwidRead,
         DetVerdict::Observed,
         return_address(),
+        SRC_FIRMWARE,
         provider as u64,
         id as u64,
-        0,
         0,
     );
     let got = unsafe { func(provider, id, buf, len) };
@@ -381,9 +408,9 @@ unsafe extern "system" fn adapters(
         DetKind::HwidRead,
         DetVerdict::Observed,
         return_address(),
+        SRC_ADAPTERS,
         family as u64,
         flags as u64,
-        0,
         0,
     );
     if !config::RAND_HWID || st != 0 || buf.is_null() || size.is_null() || cap == 0 {
@@ -425,6 +452,281 @@ unsafe extern "system" fn adapters(
         }
     }
     st
+}
+
+const ALNUM: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+const SALT_VOLUME: u32 = 0x564F_4C31;
+const SALT_NAME: u32 = 0x434F_4D50;
+const SALT_DISK: u32 = 0x4449_534B;
+const SALT_SETUP: u32 = 0x5345_5455;
+const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+
+// IAT slot of kernel32!DeviceIoControl after imp() resolves it. Only this
+// source is imported by the client, so it is the one that can be proven
+// installed; the rest ride the GetProcAddress table and stay unproven at boot.
+const DEVICE_IO_RVA: u32 = 0x064384E0;
+
+// HwidRead carries the source in a0 so `xtask detlog --kind HwidRead` says
+// which surface the client touched without decoding a symbol table.
+const SRC_FIRMWARE: u64 = 1;
+const SRC_ADAPTERS: u64 = 2;
+const SRC_VOLUME: u64 = 4;
+const SRC_DEVICE: u64 = 5;
+const SRC_NAME: u64 = 6;
+const SRC_SETUP: u64 = 7;
+
+fn fill_alnum(out: *mut u8, len: usize, seed: u32, salt: u32) {
+    let mut state_ = seed ^ salt;
+    for i in 0..len {
+        if i & 3 == 0 {
+            xors(&mut state_);
+        }
+        let byte = (state_ >> ((i & 3) * 8)) as u8;
+        unsafe { *out.add(i) = ALNUM[(byte as usize) % ALNUM.len()] };
+    }
+}
+
+fn hash_wide(text: *const u16) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    if text.is_null() {
+        return hash;
+    }
+    let mut i = 0usize;
+    while i < 260 {
+        let unit = unsafe { *text.add(i) };
+        if unit == 0 {
+            break;
+        }
+        hash ^= unit as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    hash
+}
+
+// Volume serial: the API returns a 32-bit number; derive it from the seed and
+// the queried root so two volumes do not share a serial, and so the same volume
+// reports the same number across boots.
+unsafe extern "system" fn vol_info(
+    root: *const u16,
+    volume_name: *mut u16,
+    volume_len: u32,
+    serial: *mut u32,
+    max_len: *mut u32,
+    flags: *mut u32,
+    fs_name: *mut u16,
+    fs_len: u32,
+) -> i32 {
+    let real = VOL_INFO.load(Ordering::Acquire);
+    if real.is_null() {
+        return 0;
+    }
+    let func: VolInfoFn = unsafe { core::mem::transmute(real) };
+    let ok = unsafe {
+        func(
+            root,
+            volume_name,
+            volume_len,
+            serial,
+            max_len,
+            flags,
+            fs_name,
+            fs_len,
+        )
+    };
+    if config::RAND_HWID && ok != 0 && !serial.is_null() {
+        let mut state_ = state::seed() ^ hash_wide(root) ^ SALT_VOLUME;
+        xors(&mut state_);
+        unsafe { *serial = state_ };
+    }
+    det(
+        DetSource::Hyperion,
+        DetKind::HwidRead,
+        DetVerdict::Observed,
+        return_address(),
+        SRC_VOLUME,
+        ok as u64,
+        if serial.is_null() { 0 } else { unsafe { *serial as u64 } },
+        0,
+    );
+    ok
+}
+
+// STORAGE_DEVICE_DESCRIPTOR: offsets are relative to the output buffer. Only
+// the serial string is rewritten, and only with the same character count, so
+// the descriptor stays valid for every other field the client reads.
+unsafe extern "system" fn device_io(
+    device: win::HANDLE,
+    code: u32,
+    input: *mut c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+    returned: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    let real = DEVICE_IO.load(Ordering::Acquire);
+    if real.is_null() {
+        return 0;
+    }
+    let func: DeviceIoFn = unsafe { core::mem::transmute(real) };
+    let ok = unsafe {
+        func(
+            device,
+            code,
+            input,
+            input_len,
+            output,
+            output_len,
+            returned,
+            overlapped,
+        )
+    };
+    if code != IOCTL_STORAGE_QUERY_PROPERTY {
+        return ok;
+    }
+    let bytes = if returned.is_null() {
+        output_len
+    } else {
+        unsafe { *returned }.min(output_len)
+    };
+    if config::RAND_HWID && ok != 0 && !output.is_null() && bytes >= 28 {
+        let base = output as *mut u8;
+        let offset = unsafe { ptr::read_unaligned(base.add(24) as *const u32) } as usize;
+        if offset != 0 && offset < bytes as usize {
+            let limit = (bytes as usize - offset).min(64);
+            let mut len = 0usize;
+            while len < limit && unsafe { *base.add(offset + len) } != 0 {
+                len += 1;
+            }
+            if len != 0 && len < limit {
+                let at = unsafe { base.add(offset) };
+                fill_alnum(at, len, state::seed(), SALT_DISK ^ offset as u32);
+            }
+        }
+    }
+    det(
+        DetSource::Hyperion,
+        DetKind::HwidRead,
+        DetVerdict::Observed,
+        return_address(),
+        SRC_DEVICE,
+        code as u64,
+        ok as u64,
+        bytes as u64,
+    );
+    ok
+}
+
+// The name is rewritten in place with the same character count: the API gives
+// the copied length, not the caller's capacity, so growing the string could
+// write past the buffer.
+unsafe extern "system" fn comp_name(buf: *mut u16, size: *mut u32) -> i32 {
+    let real = COMP_NAME.load(Ordering::Acquire);
+    if real.is_null() {
+        return 0;
+    }
+    let func: CompNameFn = unsafe { core::mem::transmute(real) };
+    let ok = unsafe { func(buf, size) };
+    if config::RAND_HWID && ok != 0 && !buf.is_null() && !size.is_null() {
+        let len = (unsafe { *size } as usize).min(31);
+        if len != 0 {
+            let mut bytes = [0u8; 31];
+            fill_alnum(bytes.as_mut_ptr(), len, state::seed(), SALT_NAME);
+            let prefix = b"DESKTOP-";
+            for i in 0..len.min(prefix.len()) {
+                bytes[i] = prefix[i];
+            }
+            for i in 0..len {
+                unsafe { *buf.add(i) = bytes[i] as u16 };
+            }
+            unsafe { *buf.add(len) = 0 };
+        }
+    }
+    det(
+        DetSource::Hyperion,
+        DetKind::HwidRead,
+        DetVerdict::Observed,
+        return_address(),
+        SRC_NAME,
+        ok as u64,
+        if size.is_null() { 0 } else { unsafe { *size as u64 } },
+        0,
+    );
+    ok
+}
+
+// Device instance IDs look like `USB\VID_1234&PID_5678\5&1A2B3C4D&0&7`. Only
+// the unique suffix after the last backslash is rewritten, preserving length
+// and the bus prefix the client matches on.
+unsafe extern "system" fn setup_instance_id(
+    dev_info: *mut c_void,
+    dev_data: *mut c_void,
+    id: *mut u16,
+    buffer_len: u32,
+    required: *mut u32,
+) -> i32 {
+    let real = SETUP_ID.load(Ordering::Acquire);
+    if real.is_null() {
+        return 0;
+    }
+    let func: SetupIdFn = unsafe { core::mem::transmute(real) };
+    let ok = unsafe { func(dev_info, dev_data, id, buffer_len, required) };
+    if config::RAND_HWID && ok != 0 && !id.is_null() && buffer_len != 0 {
+        let cap = (buffer_len as usize).min(1024);
+        let mut len = 0usize;
+        while len < cap && unsafe { *id.add(len) } != 0 {
+            len += 1;
+        }
+        if let Some(split) = (0..len).rev().find(|&i| unsafe { *id.add(i) } == '\\' as u16) {
+            let start = split + 1;
+            if start < len {
+                let mut state_ = state::seed() ^ SALT_SETUP ^ start as u32;
+                for i in start..len {
+                    let old = unsafe { *id.add(i) } as u32;
+                    state_ ^= old.wrapping_mul(0x9E37_79B9).rotate_left(5);
+                    state_ = state_.wrapping_mul(0x85EB_CA6B) ^ (state_ >> 13);
+                    unsafe { *id.add(i) = HEX_UPPER[(state_ as usize) & 15] as u16 };
+                }
+            }
+        }
+    }
+    det(
+        DetSource::Hyperion,
+        DetKind::HwidRead,
+        DetVerdict::Observed,
+        return_address(),
+        SRC_SETUP,
+        ok as u64,
+        buffer_len as u64,
+        0,
+    );
+    ok
+}
+
+// Proves the one HWID import the client actually has is detoured. The slot is
+// read from the client image, so a private table match is not enough.
+pub unsafe fn device_io_install_check(slot: *const win::FARPROC) -> bool {
+    if !config::RAND_HWID {
+        return true;
+    }
+    if slot.is_null() {
+        return false;
+    }
+    let installed = unsafe { *slot };
+    installed as usize == device_io as *const () as usize
+}
+
+pub unsafe fn selftest(base: *mut u8) -> bool {
+    if !config::RAND_HWID {
+        return true;
+    }
+    if base.is_null() {
+        return false;
+    }
+    let slot = unsafe { base.add(DEVICE_IO_RVA as usize) as *const win::FARPROC };
+    unsafe { device_io_install_check(slot) }
 }
 
 unsafe extern "system" fn reg_qex_a(
@@ -530,6 +832,22 @@ pub fn wrap_import(symbol: &[u8], real: usize) -> Option<usize> {
             set_once(&REG_GETW, real);
             Some(reg_get_w as *const () as usize)
         }
+        b"GetVolumeInformationW" => {
+            set_once(&VOL_INFO, real);
+            Some(vol_info as *const () as usize)
+        }
+        b"DeviceIoControl" => {
+            set_once(&DEVICE_IO, real);
+            Some(device_io as *const () as usize)
+        }
+        b"GetComputerNameW" => {
+            set_once(&COMP_NAME, real);
+            Some(comp_name as *const () as usize)
+        }
+        b"SetupDiGetDeviceInstanceIdW" => {
+            set_once(&SETUP_ID, real);
+            Some(setup_instance_id as *const () as usize)
+        }
         _ => None,
     }
 }
@@ -556,5 +874,240 @@ mod tests {
         };
         assert_ne!(first, 0);
         assert_eq!(Some(first), stable_seed());
+    }
+
+    unsafe extern "system" fn fake_vol(
+        _root: *const u16,
+        _volume_name: *mut u16,
+        _volume_len: u32,
+        serial: *mut u32,
+        _max_len: *mut u32,
+        _flags: *mut u32,
+        _fs_name: *mut u16,
+        _fs_len: u32,
+    ) -> i32 {
+        if !serial.is_null() {
+            unsafe { *serial = 0x1111_1111 };
+        }
+        1
+    }
+
+    #[test]
+    fn volume_serial_is_derived_and_stable() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            VOL_INFO.store(fake_vol as *const () as *mut c_void, Ordering::Release);
+            let mut serial = 0u32;
+            assert_eq!(
+                vol_info(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                    &mut serial,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                ),
+                1
+            );
+            assert_ne!(serial, 0x1111_1111);
+            let mut again = 0u32;
+            let _ = vol_info(
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                &mut again,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+            );
+            assert_eq!(serial, again);
+            VOL_INFO.store(ptr::null_mut(), Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn fake_name(buf: *mut u16, size: *mut u32) -> i32 {
+        for (i, ch) in "ORIGINALPC".chars().enumerate() {
+            unsafe { *buf.add(i) = ch as u16 };
+        }
+        unsafe { *buf.add(10) = 0 };
+        if !size.is_null() {
+            unsafe { *size = 10 };
+        }
+        1
+    }
+
+    #[test]
+    fn computer_name_keeps_its_length() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            COMP_NAME.store(fake_name as *const () as *mut c_void, Ordering::Release);
+            let mut buf = [0u16; 16];
+            let mut size = 16u32;
+            assert_eq!(comp_name(buf.as_mut_ptr(), &mut size), 1);
+            assert_eq!(size, 10);
+            let text: String = buf[..10].iter().map(|&c| c as u8 as char).collect();
+            assert!(text.starts_with("DESKTOP-"));
+            assert_ne!(text, "ORIGINALPC");
+            assert_eq!(buf[10], 0);
+            let first = text;
+            let mut size2 = 16u32;
+            assert_eq!(comp_name(buf.as_mut_ptr(), &mut size2), 1);
+            let second: String = buf[..10].iter().map(|&c| c as u8 as char).collect();
+            assert_eq!(first, second);
+            COMP_NAME.store(ptr::null_mut(), Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn fake_devio(
+        _device: win::HANDLE,
+        _code: u32,
+        _input: *mut c_void,
+        _input_len: u32,
+        output: *mut c_void,
+        output_len: u32,
+        returned: *mut u32,
+        _overlapped: *mut c_void,
+    ) -> i32 {
+        let base = output as *mut u8;
+        unsafe {
+            ptr::write_bytes(base, 0, output_len as usize);
+            ptr::write_unaligned(base.add(24) as *mut u32, 28);
+            let serial = b"WD-ABC123";
+            ptr::copy_nonoverlapping(serial.as_ptr(), base.add(28), serial.len());
+        }
+        if !returned.is_null() {
+            unsafe { *returned = output_len };
+        }
+        1
+    }
+
+    fn read_serial(buf: &[u8; 64]) -> String {
+        buf[28..]
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as char)
+            .collect()
+    }
+
+    #[test]
+    fn disk_serial_is_rewritten_in_place() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            DEVICE_IO.store(fake_devio as *const () as *mut c_void, Ordering::Release);
+            let mut buf = [0u8; 64];
+            let mut returned = 0u32;
+            assert_eq!(
+                device_io(
+                    ptr::null_mut(),
+                    IOCTL_STORAGE_QUERY_PROPERTY,
+                    ptr::null_mut(),
+                    0,
+                    buf.as_mut_ptr() as *mut c_void,
+                    64,
+                    &mut returned,
+                    ptr::null_mut(),
+                ),
+                1
+            );
+            let first = read_serial(&buf);
+            assert_eq!(first.len(), "WD-ABC123".len());
+            assert_ne!(first, "WD-ABC123");
+            assert!(first.chars().all(|c| c.is_ascii_alphanumeric()));
+
+            let mut again = [0u8; 64];
+            let _ = device_io(
+                ptr::null_mut(),
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                ptr::null_mut(),
+                0,
+                again.as_mut_ptr() as *mut c_void,
+                64,
+                &mut returned,
+                ptr::null_mut(),
+            );
+            assert_eq!(first, read_serial(&again));
+
+            // Any other IOCTL must pass through untouched.
+            let mut other = [0u8; 64];
+            let _ = device_io(
+                ptr::null_mut(),
+                0x0000_0001,
+                ptr::null_mut(),
+                0,
+                other.as_mut_ptr() as *mut c_void,
+                64,
+                &mut returned,
+                ptr::null_mut(),
+            );
+            assert_eq!(read_serial(&other), "WD-ABC123");
+            DEVICE_IO.store(ptr::null_mut(), Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn device_io_install_check_compares_the_slot() {
+        unsafe {
+            let mut slot: win::FARPROC = device_io as *const () as win::FARPROC;
+            assert!(device_io_install_check(&slot));
+            slot = fake_devio as *const () as win::FARPROC;
+            assert!(!device_io_install_check(&slot));
+            assert!(!device_io_install_check(ptr::null()));
+        }
+    }
+
+    unsafe extern "system" fn fake_setup(
+        _dev_info: *mut c_void,
+        _dev_data: *mut c_void,
+        id: *mut u16,
+        _buffer_len: u32,
+        _required: *mut u32,
+    ) -> i32 {
+        let text = "USB\\VID_1234&PID_5678\\5&ABCDEF";
+        for (i, ch) in text.chars().enumerate() {
+            unsafe { *id.add(i) = ch as u16 };
+        }
+        unsafe { *id.add(text.chars().count()) = 0 };
+        1
+    }
+
+    #[test]
+    fn device_instance_suffix_is_replaced_consistently() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            SETUP_ID.store(fake_setup as *const () as *mut c_void, Ordering::Release);
+            let mut buf = [0u16; 64];
+            let mut required = 0u32;
+            assert_eq!(
+                setup_instance_id(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut required,
+                ),
+                1
+            );
+            let text: String = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
+            assert!(text.starts_with("USB\\VID_1234&PID_5678\\"));
+            let suffix = text.rsplit('\\').next().unwrap();
+            assert_eq!(suffix.len(), "5&ABCDEF".len());
+            assert_ne!(suffix, "5&ABCDEF");
+            let first = text;
+
+            let mut again = [0u16; 64];
+            let _ = setup_instance_id(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                again.as_mut_ptr(),
+                again.len() as u32,
+                &mut required,
+            );
+            let second: String = again.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
+            assert_eq!(first, second);
+            SETUP_ID.store(ptr::null_mut(), Ordering::Release);
+        }
     }
 }

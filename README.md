@@ -185,6 +185,40 @@ fallback.
 
 `hook_out()` restores the original 17 bytes on `DLL_PROCESS_DETACH`.
 
+Hardware sources are covered separately from identity keys, and each rewrite
+keeps the original shape:
+
+```
+GetSystemFirmwareTable   SMBIOS table, UUID field
+GetAdaptersAddresses     adapter MAC bytes
+RegQueryValueExA/W       GUID values (MachineGuid, HwProfileGuid, ...)
+RegGetValueW             same via the newer entry point
+GetVolumeInformationW    volume serial, derived from the seed and the root path
+DeviceIoControl          STORAGE_DEVICE_DESCRIPTOR serial, same length in place
+GetComputerNameW         `DESKTOP-` prefix kept, same character count
+SetupDiGetDeviceInstanceIdW   only the unique suffix after the last backslash
+```
+
+The volume-derived value is a 32-bit number computed from the seed and a hash of
+the queried root, so two volumes do not share a serial and the same volume
+answers the same number every boot. `DeviceIoControl` is only rewritten for
+`IOCTL_STORAGE_QUERY_PROPERTY`; the descriptor offset is read from the buffer,
+and the serial is replaced with the same character count so every other field
+stays valid. The computer name and the device instance suffix are rewritten in
+place for the same reason: those APIs report the copied length, not the caller's
+capacity.
+
+Each `HwidRead` event carries the source in `a0`: `1` firmware, `2` adapters,
+`4` volume, `5` storage IOCTL, `6` computer name, `7` instance ID, so
+`xtask detlog --kind HwidRead` names the surface without a symbol table.
+
+Only `DeviceIoControl` is in the client's import table, so only that one can be
+proven installed from the image: `prep()` reads its IAT slot
+(`DEVICE_IO_RVA`), compares it with the wrapper, and writes `hwid ioctl ok` or
+`hwid ioctl fail` to the boot log. The other four are stored the first time the
+client resolves them; on this boot path it never does, so their coverage is
+staged, not exercised.
+
 ### 8. Stealth (`hide_module`, probes)
 
 `prep()` removes the emulator from the PEB loader lists and records the hidden
@@ -300,8 +334,12 @@ image base, thread id, and the two most useful arguments. `t=` is milliseconds
 since the module attached (QPC against the header start), not raw uptime.
 
 Filters narrow the tail without changing the ring: `--kind`, `--src`,
-`--verdict`, `--rva` (accepts `0x`), and `--tid`. `--json` switches both the
-event lines and the summary to JSON, so the reader can feed a script.
+`--verdict`, `--rva` (accepts `0x`), and `--tid`. A filtered read scans the whole
+live ring and stops after `--count` matches, so a rare event is not hidden behind
+a wall of `TimingProbe`; an unfiltered read prints the last `--count` slots. The
+ring wraps at 4096 records, so an event that scrolled out is gone, filter or not.
+`--json` switches both the event lines and the summary to JSON, so the reader can
+feed a script.
 
 The summary also reports `idle=` (QPC now minus the header's `last`, in ms) and
 `heat_now=`. The section's `heat` is only refreshed on the next accepted record,
