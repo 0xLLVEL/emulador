@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-C", "force-frame-pointers=yes", "-C", "target-feature=+crt-static"]
+
+# This repository carries no payload binary. Opt out of the payload gate so a
+# clean clone still builds and tests; the resulting DLL cannot restore.
+[env]
+EMU_ALLOW_NO_PAYLOAD = "1"

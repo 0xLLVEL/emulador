@@ -171,8 +171,26 @@ header 48 B + 4096 slots x 64 B, magic 0x31544544, version 1
 per event: source, kind, verdict, caller, rva, tid, four arguments
 heat: weight by verdict and kind, linear decay over 30 s, capped at 100
 dedup: 128-slot open hash, Observed events folded in a 1 s window
+rate: kinds in K_RATE_MASK sampled once per thread per 100 ms
+files: detlog.jsonl + detlog.1..3, rotated at 64 MiB each
 output: optional JSONL + snapshot next to the DLL
 ```
+
+The JSONL writer appends through one path: before a line would cross the size
+limit, the current file is closed and the generations are shifted
+(`detlog.jsonl` -> `detlog.1.jsonl` -> … -> `detlog.3.jsonl`, oldest deleted),
+then a fresh `detlog.jsonl` is created. High-frequency kinds such as
+`TimingProbe` are sampled per thread, so a boot that polls the clock does not
+produce hundreds of megabytes; dropped samples are counted in the snapshot
+(`rate`).
+
+A write failure is never silent: the sink counts failed `WriteFile` calls and
+keeps the last error code, both reported by `detlog::det_log_state()`.
+
+While the client is running, a directory listing of `detlog.jsonl` can still
+show 0 bytes even though the writer has appended hundreds of kilobytes. NTFS
+updates the directory entry size when the handle is closed or flushed; the
+data is there. Kill the client before measuring the file.
 
 The sink is compiled out unless `config::DEBUG_LOG` is `true`; the release
 build keeps it `false` so nothing is written.
@@ -273,8 +291,17 @@ $env:EMU_PAYLOAD = "C:\path\payload.br"
 cargo build --release
 ```
 
-Without `EMU_PAYLOAD` the DLL still builds; it simply carries no RCDATA
-payload and will fail `restore()` at boot.
+Without a payload the build fails on purpose: a DLL with no RCDATA resource can
+never pass `restore()`, so shipping one is a guaranteed broken boot. This
+repository carries no payload, so `.cargo/config.toml` sets
+`EMU_ALLOW_NO_PAYLOAD=1`; a clean clone still builds and tests, and the produced
+DLL is explicitly payload-less. Remove that setting (or leave the variable
+unset) when a real payload must be enforced:
+
+```powershell
+$env:EMU_ALLOW_NO_PAYLOAD = "1"   # opt out of the gate
+cargo build --release
+```
 
 `xtask` provides the packer:
 

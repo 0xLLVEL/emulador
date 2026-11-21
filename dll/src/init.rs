@@ -453,6 +453,17 @@ unsafe extern "system" fn crash_filter(pointers: *mut win::ExceptionPointers) ->
 extern "system" fn svc_report(_: *mut c_void) -> u32 {
     unsafe { win::Sleep(8000) };
     services::coverage_log("boot");
+    let (handle, bytes, fail, err) = detlog::det_log_state();
+    detlog::trace(&format!(
+        "boot: det heat={} events={} rate_drop={} log={:#x} bytes={} fail={} err={}",
+        detlog::det_heat(),
+        detlog::det_events(),
+        detlog::det_rate_drop(),
+        handle,
+        bytes,
+        fail,
+        err
+    ));
     0
 }
 

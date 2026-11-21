@@ -558,13 +558,16 @@ unsafe extern "system" {
 
 pub const MAX_PATH: usize = 260;
 pub const GENERIC_READ: DWORD = 0x8000_0000;
+pub const GENERIC_WRITE: DWORD = 0x4000_0000;
 pub const FILE_APPEND_DATA: DWORD = 0x0000_0004;
 pub const FILE_SHARE_READ: DWORD = 0x0000_0001;
 pub const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
+pub const CREATE_ALWAYS: DWORD = 2;
 pub const OPEN_EXISTING: DWORD = 3;
 pub const OPEN_ALWAYS: DWORD = 4;
 pub const FILE_BEGIN: DWORD = 0;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
+pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x0000_0001;
 pub const FILE_MAP_ALL_ACCESS: DWORD = 0x000F_001F;
 
 // x64 CRITICAL_SECTION: DebugInfo, LockCount, RecursionCount, OwningThread,
@@ -613,6 +616,9 @@ unsafe extern "system" {
         new_ptr: *mut i64,
         method: DWORD,
     ) -> BOOL;
+    pub fn GetFileSizeEx(file: HANDLE, size: *mut i64) -> BOOL;
+    pub fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: DWORD) -> BOOL;
+    pub fn DeleteFileW(name: *const u16) -> BOOL;
     pub fn GetTempPathW(len: DWORD, buf: *mut u16) -> DWORD;
     pub fn CreateFileMappingW(
         file: HANDLE,

@@ -50,17 +50,16 @@ fn rc_quote(p: &Path) -> String {
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // Payload packaging is intentionally out of tree: point EMU_PAYLOAD at a
-    // Brotli-compressed restore payload produced by `xtask pack`. Without it
-    // the DLL still builds, it just carries no RCDATA payload.
     let payload = match env::var_os("EMU_PAYLOAD") {
         Some(p) => PathBuf::from(p),
         None => manifest.join("..").join("assets").join("payload.br"),
     };
+    let allow_missing = env::var_os("EMU_ALLOW_NO_PAYLOAD").is_some();
     let rc = find_rc().expect("rc.exe not found: set RC_EXE or install Windows SDK");
 
     println!("cargo:rerun-if-env-changed=RC_EXE");
     println!("cargo:rerun-if-env-changed=EMU_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=EMU_ALLOW_NO_PAYLOAD");
     println!("cargo:rerun-if-changed=res/version.rc");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", payload.display());
@@ -71,9 +70,14 @@ fn main() {
             "{PAYLOAD_ID} RCDATA \"{}\"\n",
             rc_quote(&payload)
         ));
-    } else {
+    } else if allow_missing {
         println!(
-            "cargo:warning=payload not found at {}; building without RCDATA",
+            "cargo:warning=payload missing at {}; building without RCDATA because EMU_ALLOW_NO_PAYLOAD is set",
+            payload.display()
+        );
+    } else {
+        panic!(
+            "payload missing at {}: point EMU_PAYLOAD at a Brotli payload, or set EMU_ALLOW_NO_PAYLOAD=1 to build a DLL that cannot restore",
             payload.display()
         );
     }

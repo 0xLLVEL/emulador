@@ -22,6 +22,17 @@ const K_DECAY_MS: u64 = 30_000;
 const K_REPEAT_MS: u64 = 1_000;
 const K_SEEN_SLOTS: usize = 128;
 
+// Rate limiting and rotation keep a timing-probe-heavy boot from filling the
+// disk: at most one sample per thread per masked kind per window, and four
+// rotating JSONL files of 64 MiB each.
+const K_RATE_MS: u64 = 100;
+const K_RATE_SLOTS: usize = 64;
+const K_RATE_MASK: u32 = 1 << DetKind::TimingProbe as u32;
+const K_LOG_LIMIT: u64 = 64 * 1024 * 1024;
+const K_LOG_FILES: usize = 4;
+
+const _: () = assert!(K_RATE_SLOTS.is_power_of_two());
+
 pub const K_MAGIC: u32 = 0x3154_4544; // 'DET1'
 pub const K_VERSION: u32 = 1;
 pub const K_CAPACITY: u32 = 4096;
@@ -155,6 +166,20 @@ impl SeenSlot {
 
 const _: () = assert!(core::mem::size_of::<SeenSlot>() == 32);
 
+// Direct-mapped by (tid, kind); collisions only sample more often.
+#[derive(Clone, Copy)]
+struct RateSlot {
+    key: u64,
+    last: u64,
+}
+
+impl RateSlot {
+    const EMPTY: Self = Self {
+        key: u64::MAX,
+        last: 0,
+    };
+}
+
 struct Globals {
     hdr: *mut DetHeader,
     ring: *mut DetEvent,
@@ -166,6 +191,13 @@ struct Globals {
     last_ms: u64,
     base: u64,
     seen: [SeenSlot; K_SEEN_SLOTS],
+    rate: [RateSlot; K_RATE_SLOTS],
+    rate_drop: u32,
+    dir: [u16; win::MAX_PATH],
+    dir_len: usize,
+    log_bytes: u64,
+    write_fail: u32,
+    last_error: u32,
 }
 
 impl Globals {
@@ -181,6 +213,13 @@ impl Globals {
             last_ms: 0,
             base: 0,
             seen: [SeenSlot::EMPTY; K_SEEN_SLOTS],
+            rate: [RateSlot::EMPTY; K_RATE_SLOTS],
+            rate_drop: 0,
+            dir: [0; win::MAX_PATH],
+            dir_len: 0,
+            log_bytes: 0,
+            write_fail: 0,
+            last_error: 0,
         }
     }
 }
@@ -189,6 +228,28 @@ static mut G: Globals = Globals::empty();
 
 fn globals() -> &'static mut Globals {
     unsafe { &mut *(&raw mut G) }
+}
+
+// Sampling gate for high-frequency kinds. Unmasked kinds pass through; masked
+// ones emit at most one event per thread per window.
+#[inline]
+fn rate_gate(g: &mut Globals, kind: DetKind, tid: u32, ms: u64) -> bool {
+    if K_RATE_MASK & (1u32 << kind as u32) == 0 {
+        return true;
+    }
+    let key = ((tid as u64) << 16) | kind as u64;
+    let index = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+    let slot = &mut g.rate[index];
+    if slot.key != key {
+        *slot = RateSlot { key, last: ms };
+        return true;
+    }
+    if ms.saturating_sub(slot.last) < K_RATE_MS {
+        g.rate_drop = g.rate_drop.wrapping_add(1);
+        return false;
+    }
+    slot.last = ms;
+    true
 }
 
 fn weight(kind: DetKind, verdict: DetVerdict) -> u32 {
@@ -303,17 +364,18 @@ impl<const N: usize> core::fmt::Write for LineBuf<N> {
     }
 }
 
-fn write_file(handle: win::HANDLE, buf: *const u8, len: usize) {
+fn write_file(handle: win::HANDLE, buf: *const u8, len: usize) -> bool {
     if handle.is_null() || handle == win::INVALID_HANDLE_VALUE || len == 0 {
-        return;
+        return false;
     }
     let mut written = 0u32;
-    unsafe {
-        win::WriteFile(handle, buf, len as u32, &mut written, ptr::null_mut());
-    }
+    let ok = unsafe {
+        win::WriteFile(handle, buf, len as u32, &mut written, ptr::null_mut())
+    } != 0;
+    ok && written as usize == len
 }
 
-fn emit(g: &Globals, e: &DetEvent) {
+fn emit(g: &mut Globals, e: &DetEvent) {
     let rva = if e.caller >= g.base {
         e.caller - g.base
     } else {
@@ -341,11 +403,11 @@ fn emit(g: &Globals, e: &DetEvent) {
     )
     .is_ok();
     if ok {
-        write_file(g.log, line.as_ptr(), line.len());
+        write_line(g, line.as_ptr(), line.len());
     }
 }
 
-fn snapshot(g: &Globals) {
+fn snapshot(g: &mut Globals) {
     let head = if g.hdr.is_null() {
         0
     } else {
@@ -360,19 +422,38 @@ fn snapshot(g: &Globals) {
     let ok = write!(
         line,
         "{{\"snapshot\":1,\"t\":{},\"heat\":{},\"events\":{},\"drop\":{},\
-         \"base\":\"{:#X}\",\"pid\":{}}}\r\n",
+         \"rate\":{},\"base\":\"{:#X}\",\"pid\":{}}}\r\n",
         unsafe { win::GetTickCount64() },
         g.heat,
         head,
         drop,
+        g.rate_drop,
         g.base,
         unsafe { win::GetCurrentProcessId() }
     )
     .is_ok();
     if ok {
-        write_file(g.log, line.as_ptr(), line.len());
+        write_line(g, line.as_ptr(), line.len());
     }
 }
+
+// Single append path for JSONL: rotates before crossing the size limit.
+fn write_line(g: &mut Globals, buf: *const u8, len: usize) {
+    if g.log.is_null() || g.log == win::INVALID_HANDLE_VALUE || len == 0 {
+        return;
+    }
+    if g.log_bytes.saturating_add(len as u64) > K_LOG_LIMIT {
+        unsafe { rotate(g) };
+        if g.log.is_null() || g.log == win::INVALID_HANDLE_VALUE {
+            return;
+        }
+    }
+    if !write_file(g.log, buf, len) {
+        g.write_fail = g.write_fail.wrapping_add(1);
+        g.last_error = unsafe { win::GetLastError() };
+        return;
+    }
+    g.log_bytes = g.log_bytes.saturating_add(len as u64);}
 
 // ---------------------------------------------------------------------------
 // Core record path (unlocked; det() takes the critical section)
@@ -393,6 +474,9 @@ fn record(
     ms: u64,
     tid: u32,
 ) {
+    if !rate_gate(g, kind, tid, ms) {
+        return;
+    }
     if g.last_ms != 0 && ms > g.last_ms {
         let dt = ms - g.last_ms;
         let cut = core::cmp::min(100u64, (g.heat as u64 * dt) / K_DECAY_MS) as u32;
@@ -527,6 +611,85 @@ fn create_append(path: *const u16) -> win::HANDLE {
     }
 }
 
+fn create_truncate(path: *const u16) -> win::HANDLE {
+    unsafe {
+        win::CreateFileW(
+            path,
+            win::GENERIC_WRITE,
+            win::FILE_SHARE_READ | win::FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            win::CREATE_ALWAYS,
+            win::FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    }
+}
+
+fn file_len(handle: win::HANDLE) -> u64 {
+    if handle.is_null() || handle == win::INVALID_HANDLE_VALUE {
+        return 0;
+    }
+    let mut size: i64 = 0;
+    if unsafe { win::GetFileSizeEx(handle, &mut size) } == 0 || size < 0 {
+        return 0;
+    }
+    size as u64
+}
+
+fn set_log_dir(g: &mut Globals, dir: &[u16]) {
+    let mut len = dir.len().min(win::MAX_PATH - 1);
+    while len > 0 && dir[len - 1] == b'\\' as u16 {
+        len -= 1;
+    }
+    g.dir[..len].copy_from_slice(&dir[..len]);
+    g.dir[len] = 0;
+    g.dir_len = len;
+}
+
+// index 0 is detlog.jsonl, n > 0 is detlog.<n>.jsonl.
+fn log_path(g: &Globals, index: usize, out: &mut WideBuf<{ win::MAX_PATH }>) -> bool {
+    out.reset();
+    if g.dir_len == 0 || g.dir_len >= g.dir.len() {
+        return false;
+    }
+    if !out.push_slice(&g.dir[..g.dir_len]) || !out.push_ascii("\\detlog") {
+        return false;
+    }
+    if index != 0 && (!out.push_ascii(".") || !out.push_dec(index as u32)) {
+        return false;
+    }
+    out.push_ascii(".jsonl")
+}
+
+// detlog.jsonl -> detlog.1.jsonl -> detlog.2.jsonl -> detlog.3.jsonl
+unsafe fn rotate_files(g: &Globals) {
+    let mut from = WideBuf::<{ win::MAX_PATH }>::new();
+    let mut to = WideBuf::<{ win::MAX_PATH }>::new();
+    if log_path(g, K_LOG_FILES - 1, &mut from) {
+        unsafe { win::DeleteFileW(from.as_ptr()) };
+    }
+    for i in (1..K_LOG_FILES).rev() {
+        if log_path(g, i - 1, &mut from) && log_path(g, i, &mut to) {
+            unsafe {
+                win::MoveFileExW(from.as_ptr(), to.as_ptr(), win::MOVEFILE_REPLACE_EXISTING);
+            }
+        }
+    }
+}
+
+unsafe fn rotate(g: &mut Globals) {
+    if !g.log.is_null() && g.log != win::INVALID_HANDLE_VALUE {
+        unsafe { win::CloseHandle(g.log) };
+    }
+    g.log = win::INVALID_HANDLE_VALUE;
+    unsafe { rotate_files(g) };
+    let mut base = WideBuf::<{ win::MAX_PATH }>::new();
+    if log_path(g, 0, &mut base) {
+        g.log = create_truncate(base.as_ptr());
+    }
+    g.log_bytes = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -593,6 +756,7 @@ unsafe fn open(dir: &[u16], base: u64, tag: u32) -> bool {
         path.push_ascii("\\detlog.jsonl");
         have_path = true;
         g.log = create_append(path.as_ptr());
+        set_log_dir(g, dir);
     }
     if g.log == win::INVALID_HANDLE_VALUE {
         let mut tmp = [0u16; win::MAX_PATH];
@@ -603,8 +767,10 @@ unsafe fn open(dir: &[u16], base: u64, tag: u32) -> bool {
             path.push_ascii("detlog.jsonl");
             have_path = true;
             g.log = create_append(path.as_ptr());
+            set_log_dir(g, &tmp[..n as usize]);
         }
     }
+    g.log_bytes = file_len(g.log);
     if have_path {
         trace(&format!(
             "detlog={} heat=0 ring={}",
@@ -639,6 +805,12 @@ unsafe fn close() {
     }
     g.heat = 0;
     g.last_ms = 0;
+    g.rate_drop = 0;
+    g.dir_len = 0;
+    g.log_bytes = 0;
+    for slot in g.rate.iter_mut() {
+        *slot = RateSlot::EMPTY;
+    }
     for slot in g.seen.iter_mut() {
         *slot = SeenSlot::EMPTY;
     }
@@ -670,6 +842,29 @@ pub fn det_heat() -> u32 {
         return 0;
     }
     globals().heat
+}
+
+pub fn det_events() -> u32 {
+    if !ENABLED {
+        return 0;
+    }
+    let g = globals();
+    if g.hdr.is_null() {
+        return 0;
+    }
+    unsafe { AtomicU32::from_ptr(&mut (*g.hdr).head).load(Ordering::Acquire) }
+}
+
+pub fn det_rate_drop() -> u32 {
+    if !ENABLED {
+        return 0;
+    }
+    globals().rate_drop
+}
+
+pub fn det_log_state() -> (usize, u64, u32, u32) {
+    let g = globals();
+    (g.log as usize, g.log_bytes, g.write_fail, g.last_error)
 }
 
 pub fn det(
@@ -1349,6 +1544,41 @@ mod tests {
     }
 
     #[test]
+    fn record_writes_sampled_lines_to_the_file() {
+        let dir = TempDir::new("write");
+        let mut mem = section();
+        let mut g = attach(&mut mem, 0x1000_0000);
+        set_log_dir(&mut g, &dir.wide());
+        let mut path = WideBuf::<{ win::MAX_PATH }>::new();
+        assert!(log_path(&g, 0, &mut path));
+        g.log = create_append(path.as_ptr());
+        assert_ne!(g.log, win::INVALID_HANDLE_VALUE);
+        for ms in 0..1_000u64 {
+            for _ in 0..20 {
+                record(
+                    &mut g,
+                    DetSource::Hyperion,
+                    DetKind::TimingProbe,
+                    DetVerdict::Observed,
+                    0x1000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ms,
+                    ms,
+                    1,
+                );
+            }
+        }
+        unsafe { win::CloseHandle(g.log) };
+        let text = dir.text("detlog.jsonl");
+        assert!(!text.is_empty(), "no lines written");
+        assert!(text.lines().count() <= 12, "{}", text.lines().count());
+        assert!(g.rate_drop >= 19_000, "{}", g.rate_drop);
+    }
+
+    #[test]
     fn rva_never_underflows_below_base() {
         let event = DetEvent {
             caller: 0x800,
@@ -1361,5 +1591,35 @@ mod tests {
             0
         };
         assert_eq!(rva, 0);
+    }
+
+    #[test]
+    fn rate_gate_samples_one_timing_probe_per_thread() {
+        let mut g = Globals::empty();
+        assert!(rate_gate(&mut g, DetKind::TimingProbe, 7, 1_000));
+        assert!(!rate_gate(&mut g, DetKind::TimingProbe, 7, 1_050));
+        assert_eq!(g.rate_drop, 1);
+        assert!(rate_gate(&mut g, DetKind::TimingProbe, 7, 1_100));
+        assert!(rate_gate(&mut g, DetKind::TimingProbe, 8, 1_050));
+        for ms in 0..500 {
+            assert!(rate_gate(&mut g, DetKind::ModuleEnum, 7, ms));
+        }
+    }
+
+    #[test]
+    fn log_rotation_keeps_four_generations() {
+        let dir = TempDir::new("rotate");
+        let mut g = Globals::empty();
+        set_log_dir(&mut g, &dir.wide());
+        std::fs::write(dir.file("detlog.jsonl"), b"newest").unwrap();
+        std::fs::write(dir.file("detlog.1.jsonl"), b"older").unwrap();
+        std::fs::write(dir.file("detlog.2.jsonl"), b"oldest").unwrap();
+        unsafe { rotate(&mut g) };
+        assert_eq!(dir.text("detlog.1.jsonl"), "newest");
+        assert_eq!(dir.text("detlog.2.jsonl"), "older");
+        assert_eq!(dir.text("detlog.3.jsonl"), "oldest");
+        assert_eq!(dir.text("detlog.jsonl"), "");
+        assert_ne!(g.log, win::INVALID_HANDLE_VALUE);
+        unsafe { win::CloseHandle(g.log) };
     }
 }
