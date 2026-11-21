@@ -12,7 +12,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -30,7 +30,7 @@ jobs:
   code-only:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # This repository is the source, not the artifact: a payload, dump or built
       # DLL in the tree would leak local material and defeat the reason the repo
