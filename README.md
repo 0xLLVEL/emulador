@@ -199,15 +199,23 @@ A shared-memory ring (`Local\RobloxDetLog_<pid>`) records what the client
 probed:
 
 ```
-header 48 B + 4096 slots x 64 B, magic 0x31544544, version 2
+header 56 B + 4096 slots x 64 B, magic 0x31544544, version 3
 per event: source, kind, verdict, caller, rva, tid, four arguments
-header: base, QPC start, heat, drop, pid, rate (drop counter)
+header: base, QPC start, QPC last (last accepted record), heat, drop, pid, rate
 heat: weight by verdict and kind, linear decay over 30 s, capped at 100
 dedup: 128-slot open hash, Observed events folded in a 1 s window
 rate: kinds in K_RATE_MASK sampled once per thread per 100 ms
 files: detlog.jsonl + detlog.1..3, rotated at 64 MiB each
 output: optional JSONL + snapshot next to the DLL
+dacl: owner full, everyone else read-only (D:(A;;GA;;;OW)(A;;GR;;;WD))
 ```
+
+The section's DACL is explicit: the owner keeps write access, and every other
+process may map the ring read-only. The reader has no reason to write into it,
+and a second DLL load cannot forge evidence into a live ring. The SDDL is
+converted with `ConvertStringSecurityDescriptorToSecurityDescriptorW`; if the
+conversion ever fails, section creation falls back to the default DACL rather
+than failing a boot, and the unit test asserts the string converts.
 
 The JSONL writer appends through one path: before a line would cross the size
 limit, the current file is closed and the generations are shifted
@@ -247,12 +255,35 @@ last events, and removes it when it exits.
 cargo xtask detlog --arm --count 5     arm, then start the client
 cargo xtask detlog --count 5           read a client that is already running
 cargo xtask detlog --pid 1234 --follow stream new events as they land
+cargo xtask detlog --pid 1234 --audit  aggregate every live slot
+cargo xtask detlog --pid 1234 --json --count 5   one JSON object per line
 ```
 
 The reader maps the section read-only, decodes the header and slots, and prints
 one line per event with the source, kind, verdict, caller as an RVA against the
 image base, thread id, and the two most useful arguments. `t=` is milliseconds
 since the module attached (QPC against the header start), not raw uptime.
+
+Filters narrow the tail without changing the ring: `--kind`, `--src`,
+`--verdict`, `--rva` (accepts `0x`), and `--tid`. `--json` switches both the
+event lines and the summary to JSON, so the reader can feed a script.
+
+The summary also reports `idle=` (QPC now minus the header's `last`, in ms) and
+`heat_now=`. The section's `heat` is only refreshed on the next accepted record,
+so a quiet ring would otherwise show a stale counter; the reader applies the same
+decay the producer would (`heat - heat * idle / 30000`) without writing to the
+section.
+
+`--audit` walks every slot still present and groups counts, first and last
+sequence by kind, source and verdict. `ServiceStub` records are grouped by their
+return RVA (`a1`), which is the stable identity of a service rule across boots of
+the same client build.
+
+The ring wraps at 4096 slots, so a reader that trusts every slot can splice two
+different boots together. Every printed slot is gated on its sequence number: a
+slot whose `seq` is not the one expected was overwritten between the header read
+and the slot read, so it is counted as torn and skipped. Both the tail and
+`--audit` report the torn count in the summary.
 
 Boot-critical failures do not depend on that switch: `detlog::fatal()` writes to
 `boot.log` even in release, and falls back to `%TEMP%\emu_boot.log` when the

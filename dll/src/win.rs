@@ -13,6 +13,15 @@ pub type DWORD = u32;
 pub type WORD = u16;
 pub type ULONG_PTR = usize;
 
+#[repr(C)]
+pub struct SecurityAttributes {
+    pub length: DWORD,
+    pub security_descriptor: *mut c_void,
+    pub inherit_handle: BOOL,
+}
+
+pub const SDDL_REVISION_1: DWORD = 1;
+
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
 
 pub const MEM_COMMIT: DWORD = 0x0000_1000;
@@ -627,9 +636,16 @@ unsafe extern "system" {
     pub fn DeleteFileW(name: *const u16) -> BOOL;
     pub fn GetTempPathW(len: DWORD, buf: *mut u16) -> DWORD;
     pub fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, len: DWORD) -> DWORD;
+    pub fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl: *const u16,
+        revision: DWORD,
+        out: *mut *mut c_void,
+        size: *mut DWORD,
+    ) -> BOOL;
+    pub fn LocalFree(mem: *mut c_void) -> *mut c_void;
     pub fn CreateFileMappingW(
         file: HANDLE,
-        attributes: *mut c_void,
+        attributes: *mut SecurityAttributes,
         protect: DWORD,
         max_high: DWORD,
         max_low: DWORD,

@@ -68,11 +68,14 @@ const K_LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const K_LOG_FILES: usize = 4;
 // boot.log keeps one prior generation, so a long-lived install stays bounded.
 const K_BOOT_LIMIT: u64 = 4 * 1024 * 1024;
+// Owner keeps write access; everyone else may read the ring but not tamper
+// with the evidence.
+const K_SECTION_SDDL: &str = "D:(A;;GA;;;OW)(A;;GR;;;WD)";
 
 const _: () = assert!(K_RATE_SLOTS.is_power_of_two());
 
 pub const K_MAGIC: u32 = 0x3154_4544; // 'DET1'
-pub const K_VERSION: u32 = 2;
+pub const K_VERSION: u32 = 3;
 pub const K_CAPACITY: u32 = 4096;
 
 #[repr(u8)]
@@ -157,6 +160,9 @@ pub struct DetHeader {
     pub head: u32,
     pub base: u64,
     pub start: u64,
+    /// Event-clock tick of the last accepted record; the reader uses it to age
+    /// the heat counter without writing to the section.
+    pub last: u64,
     pub heat: u32,
     pub drop: u32,
     pub pid: u32,
@@ -173,14 +179,15 @@ const _: () = assert!(core::mem::offset_of!(DetEvent, source) == 54);
 const _: () = assert!(core::mem::offset_of!(DetEvent, verdict) == 55);
 const _: () = assert!(core::mem::offset_of!(DetEvent, seq) == 56);
 const _: () = assert!(core::mem::offset_of!(DetEvent, pad) == 60);
-const _: () = assert!(core::mem::size_of::<DetHeader>() == 48);
+const _: () = assert!(core::mem::size_of::<DetHeader>() == 56);
 const _: () = assert!(core::mem::offset_of!(DetHeader, head) == 12);
 const _: () = assert!(core::mem::offset_of!(DetHeader, base) == 16);
 const _: () = assert!(core::mem::offset_of!(DetHeader, start) == 24);
-const _: () = assert!(core::mem::offset_of!(DetHeader, heat) == 32);
-const _: () = assert!(core::mem::offset_of!(DetHeader, drop) == 36);
-const _: () = assert!(core::mem::offset_of!(DetHeader, pid) == 40);
-const _: () = assert!(K_SECTION_SIZE == 48 + 4096 * 64);
+const _: () = assert!(core::mem::offset_of!(DetHeader, last) == 32);
+const _: () = assert!(core::mem::offset_of!(DetHeader, heat) == 40);
+const _: () = assert!(core::mem::offset_of!(DetHeader, drop) == 44);
+const _: () = assert!(core::mem::offset_of!(DetHeader, pid) == 48);
+const _: () = assert!(K_SECTION_SIZE == 56 + 4096 * 64);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -544,6 +551,7 @@ fn record(
     unsafe {
         (*g.hdr).heat = g.heat;
         (*g.hdr).rate = g.rate_drop;
+        (*g.hdr).last = tick;
         if repeat(g, source, kind, verdict, caller, a0, ms) {
             (*g.hdr).drop = (*g.hdr).drop.wrapping_add(1);
             return;
@@ -775,16 +783,46 @@ unsafe fn open_with(g: &mut Globals, dir: &[u16], base: u64, tag: u32, want_log:
         name.push_dec(tag);
     }
 
+    // Read-only for everyone else: the ring is evidence, and the reader has no
+    // reason to write into it. Falls back to the default DACL if the SDDL is
+    // rejected, so a boot never depends on this.
+    let mut sddl = WideBuf::<32>::new();
+    sddl.push_ascii(K_SECTION_SDDL);
+    let mut sa = win::SecurityAttributes {
+        length: core::mem::size_of::<win::SecurityAttributes>() as u32,
+        security_descriptor: ptr::null_mut(),
+        inherit_handle: 0,
+    };
+    if unsafe {
+        win::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            win::SDDL_REVISION_1,
+            &mut sa.security_descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        sa.security_descriptor = ptr::null_mut();
+    }
+    let attrs = if sa.security_descriptor.is_null() {
+        ptr::null_mut()
+    } else {
+        &mut sa as *mut win::SecurityAttributes
+    };
+
     g.map = unsafe {
         win::CreateFileMappingW(
             win::INVALID_HANDLE_VALUE,
-            ptr::null_mut(),
+            attrs,
             win::PAGE_READWRITE,
             0,
             K_SECTION_SIZE as u32,
             name.as_ptr(),
         )
     };
+    if !sa.security_descriptor.is_null() {
+        unsafe { win::LocalFree(sa.security_descriptor) };
+    }
     if !g.map.is_null() {
         let view = unsafe {
             win::MapViewOfFile(g.map, win::FILE_MAP_ALL_ACCESS, 0, 0, K_SECTION_SIZE)
@@ -1257,12 +1295,35 @@ mod tests {
     #[test]
     fn layout_matches_the_reference() {
         assert_eq!(core::mem::size_of::<DetEvent>(), 64);
-        assert_eq!(core::mem::size_of::<DetHeader>(), 48);
+        assert_eq!(core::mem::size_of::<DetHeader>(), 56);
         assert_eq!(core::mem::size_of::<SeenSlot>(), 32);
-        assert_eq!(K_SECTION_SIZE, 262_192);
+        assert_eq!(K_SECTION_SIZE, 262_200);
         assert_eq!(K_MAGIC, 0x3154_4544);
-        assert_eq!(K_VERSION, 2);
+        assert_eq!(K_VERSION, 3);
         assert_eq!(K_CAPACITY, 4096);
+    }
+
+    // The DACL string is the one part of the section open that the kernel can
+    // reject at runtime; a typo would silently fall back to the default DACL
+    // and hand every process write access to the evidence.
+    #[test]
+    fn section_sddl_converts() {
+        let mut sddl = WideBuf::<32>::new();
+        assert!(sddl.push_ascii(K_SECTION_SDDL));
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                win::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    win::SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert!(!descriptor.is_null());
+        unsafe { win::LocalFree(descriptor) };
     }
 
     #[test]
@@ -1567,6 +1628,7 @@ mod tests {
         assert_eq!(unsafe { (*g.hdr).head }, 0);
         assert_eq!(unsafe { (*g.hdr).drop }, 0);
         assert_eq!(unsafe { (*g.hdr).heat }, 0);
+        assert_eq!(unsafe { (*g.hdr).last }, 0);
         assert_ne!(unsafe { (*g.hdr).start }, 0);
         unsafe {
             win::UnmapViewOfFile(g.hdr as *const c_void);
