@@ -373,6 +373,12 @@ The release profile uses `panic = "abort"`, fat LTO, one codegen unit and
 stripped symbols. `.cargo/config.toml` adds `+crt-static` so the DLL does not
 need the Visual C++ runtime.
 
+GitHub Actions runs the same gate on `windows-latest`: `cargo build --release
+--locked` and `cargo test --release --locked`, because the release profile is the
+one that ships. A second job refuses a tree that tracks a binary (`dll`, `exe`,
+`pdb`, `lib`, `obj`, `dmp`, `bin`, `br`) or any file above 5 MB, so the public
+repository cannot quietly become an artifact dump.
+
 No `windows`, `windows-sys` or `winapi` crates: every Win32 signature lives in
 `dll/src/win.rs`.
 

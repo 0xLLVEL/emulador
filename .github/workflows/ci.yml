@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The workspace pins force-frame-pointers and static CRT in .cargo/config.toml.
+      # The release profile is the one that ships, so it is built and tested, not just
+      # the debug profile.
+      - name: build
+        run: cargo build --release --locked
+
+      - name: test
+        run: cargo test --release --locked
+
+  code-only:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repository is the source, not the artifact: a payload, dump or built
+      # DLL in the tree would leak local material and defeat the reason the repo
+      # exists. Fail loudly instead of silently shipping one.
+      - name: refuse binaries
+        shell: pwsh
+        run: |
+          $bad = git ls-files | Where-Object { $_ -match '\.(dll|exe|pdb|lib|obj|dmp|bin|br)$' }
+          if ($bad) {
+            Write-Host "binary files are tracked:"
+            $bad | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          $big = git ls-files | ForEach-Object {
+            $item = Get-Item $_
+            if ($item.Length -gt 5MB) { "{0} ({1} B)" -f $_, $item.Length }
+          }
+          if ($big) {
+            Write-Host "files above 5 MB are tracked:"
+            $big | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "code-only tree"
