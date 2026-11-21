@@ -617,6 +617,7 @@ unsafe extern "system" {
         method: DWORD,
     ) -> BOOL;
     pub fn GetFileSizeEx(file: HANDLE, size: *mut i64) -> BOOL;
+    pub fn FlushFileBuffers(file: HANDLE) -> BOOL;
     pub fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: DWORD) -> BOOL;
     pub fn DeleteFileW(name: *const u16) -> BOOL;
     pub fn GetTempPathW(len: DWORD, buf: *mut u16) -> DWORD;

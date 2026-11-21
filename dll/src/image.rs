@@ -533,6 +533,45 @@ mod tests {
     }
 
     #[test]
+    fn img_guard_names_each_early_failure() {
+        unsafe {
+            assert_eq!(img_why(ptr::null_mut()), Err("null base"));
+
+            let mem = alloc(0x3000);
+            ptr::write_bytes(mem, 0, 0x3000);
+            assert_eq!(img_why(mem), Err("dos header"));
+
+            let dos = mem as *mut win::ImageDosHeader;
+            (*dos).e_magic = win::IMAGE_DOS_SIGNATURE;
+            assert_eq!(img_why(mem), Err("dos header"));
+
+            (*dos).e_lfanew = 0x40;
+            assert_eq!(img_why(mem), Err("nt signature"));
+
+            let nt = win::nt_headers(mem);
+            (*nt).signature = win::IMAGE_NT_SIGNATURE;
+            (*nt).file_header.number_of_sections = 1;
+            (*nt).file_header.time_date_stamp = p::IMAGE_TIMESTAMP;
+            (*nt).optional_header.magic = win::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+            (*nt).optional_header.size_of_image = p::IMAGE_SIZE;
+            (*nt).optional_header.address_of_entry_point = p::ORIGINAL_ENTRY;
+            let sh = win::section_headers(mem);
+            let name = core::ptr::addr_of_mut!((*sh).name) as *mut u8;
+            ptr::copy_nonoverlapping(b".data".as_ptr(), name, 5);
+            assert_eq!(img_why(mem), Err(".text missing"));
+            free(mem);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_unusable_archives() {
+        assert!(decode(&[]).is_none());
+        assert!(decode(b"not brotli").is_none());
+        assert!(decode(&[0xFF; 64]).is_none());
+        assert!(decode(&[0x00; 8]).is_none());
+    }
+
+    #[test]
     fn file_head_reads_the_running_exe() {
         unsafe {
             let base = win::GetModuleHandleW(ptr::null()) as *mut u8;

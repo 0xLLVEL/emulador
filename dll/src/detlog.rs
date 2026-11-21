@@ -439,10 +439,14 @@ fn snapshot(g: &mut Globals) {
 
 // Single append path for JSONL: rotates before crossing the size limit.
 fn write_line(g: &mut Globals, buf: *const u8, len: usize) {
+    write_line_limit(g, buf, len, K_LOG_LIMIT)
+}
+
+fn write_line_limit(g: &mut Globals, buf: *const u8, len: usize, limit: u64) {
     if g.log.is_null() || g.log == win::INVALID_HANDLE_VALUE || len == 0 {
         return;
     }
-    if g.log_bytes.saturating_add(len as u64) > K_LOG_LIMIT {
+    if g.log_bytes.saturating_add(len as u64) > limit {
         unsafe { rotate(g) };
         if g.log.is_null() || g.log == win::INVALID_HANDLE_VALUE {
             return;
@@ -453,7 +457,17 @@ fn write_line(g: &mut Globals, buf: *const u8, len: usize) {
         g.last_error = unsafe { win::GetLastError() };
         return;
     }
-    g.log_bytes = g.log_bytes.saturating_add(len as u64);}
+    g.log_bytes = g.log_bytes.saturating_add(len as u64);
+}
+
+// Push buffered JSONL to disk without closing the handle. A hard crash never
+// reaches close(), and the tail of the log is the part worth keeping.
+fn flush_log(g: &Globals) -> bool {
+    if g.log.is_null() || g.log == win::INVALID_HANDLE_VALUE {
+        return false;
+    }
+    unsafe { win::FlushFileBuffers(g.log) != 0 }
+}
 
 // ---------------------------------------------------------------------------
 // Core record path (unlocked; det() takes the critical section)
@@ -796,6 +810,7 @@ unsafe fn close() {
         g.map = ptr::null_mut();
     }
     if g.log != win::INVALID_HANDLE_VALUE {
+        flush_log(g);
         unsafe { win::CloseHandle(g.log) };
         g.log = win::INVALID_HANDLE_VALUE;
     }
@@ -918,6 +933,9 @@ pub fn trace(text: &str) {
 // in release, where trace() is compiled out. Before init() knows the module
 // directory the line lands in %TEMP%\emu_boot.log instead of being lost.
 pub fn fatal(text: &str) {
+    // The detection sink is buffered; a crash is the one moment its tail has
+    // to reach disk, and close() will never run.
+    let _ = flush_log(globals());
     if state::dir().is_empty() {
         unsafe { write_temp_trace(text.as_bytes()) }
         return;
@@ -1621,5 +1639,55 @@ mod tests {
         assert_eq!(dir.text("detlog.jsonl"), "");
         assert_ne!(g.log, win::INVALID_HANDLE_VALUE);
         unsafe { win::CloseHandle(g.log) };
+    }
+
+    // Drives the real write path with a small limit: rotation has to happen
+    // from write_line_limit, not from pre-made files.
+    #[test]
+    fn write_path_rotates_at_the_limit() {
+        let dir = TempDir::new("rotate-live");
+        let mut g = Globals::empty();
+        set_log_dir(&mut g, &dir.wide());
+        let mut path = WideBuf::<{ win::MAX_PATH }>::new();
+        assert!(log_path(&g, 0, &mut path));
+        g.log = create_append(path.as_ptr());
+        assert_ne!(g.log, win::INVALID_HANDLE_VALUE);
+        let mut total = 0usize;
+        for n in 0..200u32 {
+            let line = format!("{{\"n\":{n}}}\n");
+            total += 1;
+            write_line_limit(&mut g, line.as_ptr(), line.len(), 512);
+        }
+        unsafe { win::CloseHandle(g.log) };
+        let mut lines = 0usize;
+        for index in 0..K_LOG_FILES {
+            let name = if index == 0 {
+                "detlog.jsonl".to_string()
+            } else {
+                format!("detlog.{index}.jsonl")
+            };
+            lines += dir.text(&name).lines().count();
+        }
+        assert_eq!(lines, total);
+        assert!(dir.file("detlog.3.jsonl").exists(), "oldest generation missing");
+        let newest = std::fs::metadata(dir.file("detlog.jsonl")).unwrap().len();
+        assert!(newest <= 512, "{newest}");
+        assert!(newest > 0);
+    }
+
+    #[test]
+    fn flush_requires_a_live_handle() {
+        let mut g = Globals::empty();
+        assert!(!flush_log(&g));
+        let dir = TempDir::new("flush");
+        set_log_dir(&mut g, &dir.wide());
+        let mut path = WideBuf::<{ win::MAX_PATH }>::new();
+        assert!(log_path(&g, 0, &mut path));
+        g.log = create_append(path.as_ptr());
+        assert_ne!(g.log, win::INVALID_HANDLE_VALUE);
+        assert!(write_file(g.log, b"x".as_ptr(), 1));
+        assert!(flush_log(&g));
+        unsafe { win::CloseHandle(g.log) };
+        assert_eq!(dir.text("detlog.jsonl"), "x");
     }
 }

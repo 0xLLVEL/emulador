@@ -207,7 +207,9 @@ produce hundreds of megabytes; dropped samples are counted in the snapshot
 (`rate`).
 
 A write failure is never silent: the sink counts failed `WriteFile` calls and
-keeps the last error code, both reported by `detlog::det_log_state()`.
+keeps the last error code, both reported by `detlog::det_log_state()`. A fatal
+path (`detlog::fatal`, used by the panic hook and the crash filter) flushes the
+log before writing its own line, so a crash does not take the tail with it.
 
 While the client is running, a directory listing of `detlog.jsonl` can still
 show 0 bytes even though the writer has appended hundreds of kilobytes. NTFS
