@@ -41,6 +41,14 @@ type SendToFn = unsafe extern "system" fn(usize, *const u8, i32, i32, *const c_v
 type NtQsiFn = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 type NtQvmFn = unsafe extern "system" fn(win::HANDLE, *mut c_void, u32, *mut c_void, usize, *mut usize) -> i32;
 type CrdpFn = unsafe extern "system" fn(win::HANDLE, *mut i32) -> i32;
+type NtQipFn =
+    unsafe extern "system" fn(win::HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
+type NtQoFn = unsafe extern "system" fn(win::HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
+type NtGctFn = unsafe extern "system" fn(win::HANDLE, *mut c_void) -> i32;
+type NtSitFn = unsafe extern "system" fn(win::HANDLE, u32, *mut c_void, u32) -> i32;
+
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+const STATUS_PROCEDURE_NOT_FOUND: i32 = 0xC000_007A_u32 as i32;
 
 static G_VQ: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static G_VP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -60,6 +68,10 @@ static G_SENDTO: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static G_NTQSI: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static G_NTQVM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static G_CRDP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static G_NTQIP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static G_NTQO: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static G_NTGCT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static G_NTSIT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[inline(always)]
 fn load<T: Copy>(slot: &AtomicPtr<c_void>) -> Option<T> {
@@ -722,6 +734,189 @@ unsafe extern "system" fn crdp(process: win::HANDLE, present: *mut i32) -> i32 {
     }
 }
 
+// PROCESSINFOCLASS values the client can use to discover a debugger without
+// touching kernel32.
+const PROCESS_DEBUG_PORT: u32 = 7;
+const PROCESS_DEBUG_OBJECT_HANDLE: u32 = 30;
+const PROCESS_DEBUG_FLAGS: u32 = 31;
+
+unsafe extern "system" fn nt_qip(
+    process: win::HANDLE,
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+    ret_len: *mut u32,
+) -> i32 {
+    if config::STEALTH {
+        let size = match class {
+            PROCESS_DEBUG_PORT | PROCESS_DEBUG_OBJECT_HANDLE => 8usize,
+            PROCESS_DEBUG_FLAGS => 4,
+            _ => 0,
+        };
+        if size != 0 {
+            let _ = process;
+            if info.is_null() || (len as usize) < size {
+                return STATUS_INVALID_PARAMETER;
+            }
+            // DebugPort and DebugObjectHandle are both pointer-sized: zero means
+            // "no debugger". DebugFlags is the inverted one: 1 means clear.
+            let value: u64 = if class == PROCESS_DEBUG_FLAGS { 1 } else { 0 };
+            unsafe {
+                if size == 8 {
+                    ptr::write_unaligned(info as *mut u64, value)
+                } else {
+                    ptr::write_unaligned(info as *mut u32, value as u32)
+                }
+                if !ret_len.is_null() {
+                    *ret_len = size as u32;
+                }
+            }
+            det(
+                DetSource::Hyperion,
+                DetKind::DebugCheck,
+                DetVerdict::Suspicious,
+                return_address(),
+                class as u64,
+                value,
+                size as u64,
+                0,
+            );
+            return 0;
+        }
+    }
+    let r = match load::<NtQipFn>(&G_NTQIP) {
+        Some(func) => unsafe { func(process, class, info, len, ret_len) },
+        None => STATUS_PROCEDURE_NOT_FOUND,
+    };
+    det(
+        DetSource::Hyperion,
+        DetKind::DebugCheck,
+        DetVerdict::Observed,
+        return_address(),
+        class as u64,
+        at(info),
+        r as u32 as u64,
+        0,
+    );
+    r
+}
+
+unsafe extern "system" fn nt_qo(
+    handle: win::HANDLE,
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+    ret_len: *mut u32,
+) -> i32 {
+    let r = match load::<NtQoFn>(&G_NTQO) {
+        Some(func) => unsafe { func(handle, class, info, len, ret_len) },
+        None => STATUS_PROCEDURE_NOT_FOUND,
+    };
+    det(
+        DetSource::Hyperion,
+        DetKind::DebugCheck,
+        DetVerdict::Observed,
+        return_address(),
+        class as u64,
+        at(info),
+        r as u32 as u64,
+        0,
+    );
+    r
+}
+
+unsafe extern "system" fn nt_gct(thread: win::HANDLE, context: *mut c_void) -> i32 {
+    let r = match load::<NtGctFn>(&G_NTGCT) {
+        Some(func) => unsafe { func(thread, context) },
+        None => STATUS_PROCEDURE_NOT_FOUND,
+    };
+    det(
+        DetSource::Hyperion,
+        DetKind::DebugCheck,
+        DetVerdict::Observed,
+        return_address(),
+        at(context),
+        r as u32 as u64,
+        0,
+        0,
+    );
+    r
+}
+
+const THREAD_HIDE_FROM_DEBUGGER: u32 = 17;
+
+unsafe extern "system" fn nt_sit(
+    thread: win::HANDLE,
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+) -> i32 {
+    // Hiding a thread is harmless and sometimes the client hiding its own
+    // worker; let the real call happen and only record the intent.
+    let r = match load::<NtSitFn>(&G_NTSIT) {
+        Some(func) => unsafe { func(thread, class, info, len) },
+        None => STATUS_PROCEDURE_NOT_FOUND,
+    };
+    det(
+        DetSource::Hyperion,
+        DetKind::DebugCheck,
+        DetVerdict::Observed,
+        return_address(),
+        class as u64,
+        (class == THREAD_HIDE_FROM_DEBUGGER) as u64,
+        r as u32 as u64,
+        0,
+    );
+    r
+}
+
+const NTDLL: [u16; 10] = [0x6E, 0x74, 0x64, 0x6C, 0x6C, 0x2E, 0x64, 0x6C, 0x6C, 0];
+
+// IAT slot of kernel32!GetProcAddress after imp() resolves it (profile Import
+// table). The ntdll wrappers are reachable only through this pointer, so the
+// boot check reads the slot that the client will actually call.
+const GETPROC_RVA: u32 = 0x06438D68;
+
+// Proves the detour is reachable through the client's own GetProcAddress slot,
+// not just through our private table. `gpa` is the value already installed in
+// the IAT; a fake one lets the test drive this without a client image.
+pub unsafe fn nt_install_check(gpa: win::FARPROC) -> bool {
+    if !config::STEALTH {
+        return true;
+    }
+    if gpa.is_null() {
+        return false;
+    }
+    let module = unsafe { win::GetModuleHandleW(NTDLL.as_ptr()) };
+    if module.is_null() {
+        return false;
+    }
+    let name = b"NtQueryInformationProcess\0";
+    let proc_addr: ProcAddrFn = unsafe { core::mem::transmute(gpa) };
+    let detour = unsafe { proc_addr(module, name.as_ptr()) };
+    if detour as usize != nt_qip as *const () as usize {
+        return false;
+    }
+    let query: NtQipFn = unsafe { core::mem::transmute(detour) };
+    let mut flags = 0u32;
+    let status = unsafe {
+        query(
+            (-1isize) as win::HANDLE,
+            PROCESS_DEBUG_FLAGS,
+            &mut flags as *mut u32 as *mut c_void,
+            4,
+            ptr::null_mut(),
+        )
+    };
+    status == 0 && flags == 1
+}
+
+pub unsafe fn nt_selftest(base: *mut u8) -> bool {
+    let slot = unsafe { base.add(GETPROC_RVA as usize) as *const win::FARPROC };
+    let gpa = unsafe { *slot };
+    unsafe { nt_install_check(gpa) }
+}
+
 // probeHook: HWID branches first (probes.cpp does the same under kRandHwid),
 // then the stealth wrapper table. Returns true when Out was replaced.
 pub unsafe fn hook(name: *const u8, real: win::FARPROC, out: *mut win::FARPROC) -> bool {
@@ -770,6 +965,10 @@ pub unsafe fn hook(name: *const u8, real: win::FARPROC, out: *mut win::FARPROC) 
     probe!(G_NTQSI, nt_qsi, b"NtQuerySystemInformation");
     probe!(G_NTQVM, nt_qvm, b"NtQueryVirtualMemory");
     probe!(G_CRDP, crdp, b"CheckRemoteDebuggerPresent");
+    probe!(G_NTQIP, nt_qip, b"NtQueryInformationProcess");
+    probe!(G_NTQO, nt_qo, b"NtQueryObject");
+    probe!(G_NTGCT, nt_gct, b"NtGetContextThread");
+    probe!(G_NTSIT, nt_sit, b"NtSetInformationThread");
     false
 }
 
@@ -816,6 +1015,14 @@ pub fn wrapper_for(symbol: &[u8]) -> Option<usize> {
         Some(nt_qvm as *const () as usize)
     } else if name == b"CheckRemoteDebuggerPresent" {
         Some(crdp as *const () as usize)
+    } else if name == b"NtQueryInformationProcess" {
+        Some(nt_qip as *const () as usize)
+    } else if name == b"NtQueryObject" {
+        Some(nt_qo as *const () as usize)
+    } else if name == b"NtGetContextThread" {
+        Some(nt_gct as *const () as usize)
+    } else if name == b"NtSetInformationThread" {
+        Some(nt_sit as *const () as usize)
     } else {
         None
     }
@@ -958,11 +1165,122 @@ mod tests {
             b"NtQuerySystemInformation",
             b"NtQueryVirtualMemory",
             b"CheckRemoteDebuggerPresent",
+            b"NtQueryInformationProcess",
+            b"NtQueryObject",
+            b"NtGetContextThread",
+            b"NtSetInformationThread",
         ] {
             assert!(wrapper_for(symbol).is_some(), "missing {}", String::from_utf8_lossy(symbol));
         }
         assert!(wrapper_for(b"NotAProbe").is_none());
         assert!(wrapper_for(b"").is_none());
+    }
+
+    // The client never imports ntdll: it resolves these through GetProcAddress,
+    // which the gpa wrapper feeds back into hook(). Spoofing happens before the
+    // real pointer is touched, so a null slot is the correct test setup.
+    #[test]
+    fn ntdll_debug_classes_are_spoofed() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            let mut port = u64::MAX;
+            let mut len = 0u32;
+            assert_eq!(
+                nt_qip(
+                    ptr::null_mut(),
+                    PROCESS_DEBUG_PORT,
+                    &mut port as *mut u64 as *mut c_void,
+                    8,
+                    &mut len,
+                ),
+                0
+            );
+            assert_eq!(port, 0);
+            assert_eq!(len, 8);
+
+            let mut object = u64::MAX;
+            assert_eq!(
+                nt_qip(
+                    ptr::null_mut(),
+                    PROCESS_DEBUG_OBJECT_HANDLE,
+                    &mut object as *mut u64 as *mut c_void,
+                    8,
+                    &mut len,
+                ),
+                0
+            );
+            assert_eq!(object, 0);
+
+            let mut flags = 0u32;
+            assert_eq!(
+                nt_qip(
+                    ptr::null_mut(),
+                    PROCESS_DEBUG_FLAGS,
+                    &mut flags as *mut u32 as *mut c_void,
+                    4,
+                    &mut len,
+                ),
+                0
+            );
+            assert_eq!(flags, 1);
+            assert_eq!(len, 4);
+
+            // A buffer shorter than the class needs is rejected, not overrun.
+            let mut short = u64::MAX;
+            assert_eq!(
+                nt_qip(
+                    ptr::null_mut(),
+                    PROCESS_DEBUG_PORT,
+                    &mut short as *mut u64 as *mut c_void,
+                    4,
+                    &mut len,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            // Any other class is a real query; with no backing pointer it must
+            // fail closed instead of returning invented data.
+            assert_eq!(
+                nt_qip(ptr::null_mut(), 0, ptr::null_mut(), 0, ptr::null_mut()),
+                STATUS_PROCEDURE_NOT_FOUND
+            );
+        }
+    }
+
+    #[test]
+    fn ntdll_lookup_stores_the_real_pointer() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            G_NTQIP.store(ptr::null_mut(), Ordering::Release);
+            let fake = 0x1_2345_6789usize as win::FARPROC;
+            let mut out: win::FARPROC = ptr::null_mut();
+            let name = b"NtQueryInformationProcess\0";
+            assert!(hook(name.as_ptr(), fake, &mut out));
+            assert_eq!(out as usize, nt_qip as *const () as usize);
+            assert_eq!(G_NTQIP.load(Ordering::Acquire) as usize, fake as usize);
+            G_NTQIP.store(ptr::null_mut(), Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn fake_gpa(
+        _module: win::HMODULE,
+        _name: *const u8,
+    ) -> win::FARPROC {
+        nt_qip as *const () as win::FARPROC
+    }
+
+    unsafe extern "system" fn null_gpa(_module: win::HMODULE, _name: *const u8) -> win::FARPROC {
+        ptr::null_mut()
+    }
+
+    #[test]
+    fn ntdll_install_check_walks_the_real_gpa_contract() {
+        let _guard = crate::testlock::lock();
+        unsafe {
+            assert!(nt_install_check(fake_gpa as *const () as win::FARPROC));
+            assert!(!nt_install_check(null_gpa as *const () as win::FARPROC));
+            assert!(!nt_install_check(ptr::null_mut()));
+        }
     }
 
     #[test]

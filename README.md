@@ -203,6 +203,31 @@ The `lod` thread waits 5 s, then loads `module.dll` from the client folder and
 hides it the same way. That module is optional; without it the client boots
 normally.
 
+The ntdll debug surface is covered too. The client does not import ntdll, so
+these are reached through its `GetProcAddress` slot, which `imp()` already wraps:
+
+```
+NtQueryInformationProcess   ProcessDebugPort 7, DebugObjectHandle 30, DebugFlags 31
+NtQueryObject               logged
+NtGetContextThread          logged
+NtSetInformationThread      logged, including ThreadHideFromDebugger 17
+```
+
+For the three debug classes under `STEALTH`, the answer is synthesized before the
+real call: a zero pointer for `DebugPort`/`DebugObjectHandle`, `1` for
+`DebugFlags` (the inverted one). A buffer shorter than the class needs is rejected
+with `STATUS_INVALID_PARAMETER` instead of overrunning; an unrelated class goes
+to the real function, and with no backing pointer fails closed as
+`STATUS_PROCEDURE_NOT_FOUND`.
+
+At boot `prep()` proves the wiring instead of assuming it: it reads the client's
+own `GetProcAddress` slot (`GETPROC_RVA`), resolves
+`NtQueryInformationProcess`, requires the returned pointer to be the detour, and
+calls it once for `DebugFlags`. `boot.log` records `nt ok` or `nt fail`, and
+`smoke.ps1 -ExpectDebug` fails on the latter. The single `DebugCheck` event at
+sequence 2 in the ring is that self-test, not a client probe. Resolution through
+`LdrGetProcedureAddress` is not covered.
+
 ### 9. Detection sink (`detlog`)
 
 A shared-memory ring (`Local\RobloxDetLog_<pid>`) records what the client

@@ -371,6 +371,15 @@ pub unsafe fn prep() -> bool {
         return false;
     }
 
+    // The ntdll probes are resolved through GetProcAddress, which the client
+    // may never call for these names. Exercise the real IAT detour once so the
+    // install is proven at boot instead of assumed.
+    if unsafe { crate::probes::nt_selftest(base) } {
+        detlog::trace("nt ok");
+    } else {
+        detlog::trace("nt fail");
+    }
+
     // Hide this DLL from the loader lists now, rather than relying on the
     // delayed module.dll load (which is absent in many client installs).
     if config::STEALTH {
