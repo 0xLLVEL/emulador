@@ -474,6 +474,16 @@ extern "system" fn svc_report(_: *mut c_void) -> u32 {
             fails
         ));
     }
+    // A boot only reaches the rules its own path touches. Keep reporting so a
+    // long session timestamps the rest instead of needing another boot; the tag
+    // carries the elapsed seconds. Only a build with the log sink has anywhere
+    // to put these lines.
+    if detlog::ENABLED {
+        for tick in 1..=40u32 {
+            unsafe { win::Sleep(15_000) };
+            services::coverage_log(&format!("svc t={}", tick * 15 + 8));
+        }
+    }
     0
 }
 

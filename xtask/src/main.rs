@@ -1,3 +1,5 @@
+mod detlog;
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -11,7 +13,7 @@ const PAYLOAD_COUNT_DEFAULT: u64 = 0x0004_1629;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  xtask make-payload --exe <decrypted.exe> --out <payload.bin>\n  xtask pack --in <payload.bin> --out <payload.br> [--quality 9] [--lgwin 24]\n  xtask unpack --in <payload.br> --out <payload.bin>"
+        "usage:\n  xtask make-payload --exe <decrypted.exe> --out <payload.bin>\n  xtask pack --in <payload.bin> --out <payload.br> [--quality 9] [--lgwin 24]\n  xtask unpack --in <payload.br> --out <payload.bin>\n  xtask verify-payload --exe <decrypted.exe> --in <payload.bin>\n  xtask detlog [--pid <n> | --exe <name>] [--count <n>] [--follow] [--arm]"
     );
     std::process::exit(2)
 }
@@ -287,6 +289,7 @@ fn main() -> ExitCode {
         "pack" => pack(&args[2..]),
         "unpack" => unpack(&args[2..]),
         "verify-payload" => verify_payload(&args[2..]),
+        "detlog" => detlog::run(&args[2..]),
         _ => usage(),
     };
     match result {

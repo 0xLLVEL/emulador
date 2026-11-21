@@ -130,11 +130,19 @@ waits 8 s after the hand-off and, when `DEBUG_LOG` is on, writes:
 ```
 boot: svc client=9/18 hits=9 mask=0x00003fc8
 boot: svc self=18/18 mask=0x0003ffff
+boot: svc new 3 Callbacks4 at=3203ms
 boot: svc idle 0 Callbacks1 fault=-7 ret=0x009D961A
 ```
 
-`client` is what the running client actually called. A boot only reaches the
-stubs its own code path needs, so the idle list is normal and stays visible.
+`client` is what the running client actually called. `at=` is milliseconds since
+the module attached, stamped on the first hit of that rule with a compare-exchange
+so the earliest thread wins. A boot only reaches the stubs its own code path
+needs, so the idle list is normal and stays visible; the idle lines are printed
+once, in the boot report. The report then repeats every 15 s for 10 minutes as
+`svc t=<sec>: ...`, which is how a long session timestamps the rules it reaches
+after boot instead of needing a second boot. `new` lines appear in whatever
+report first sees that bit, so a rule that fires later shows up as
+`svc t=98: svc new 16 Records1 at=95012ms`.
 
 `self` is a self-test that closes the verification gap: for every rule, the
 emulator fabricates an argument frame on its own stack, installs the rule's real
@@ -189,8 +197,9 @@ A shared-memory ring (`Local\RobloxDetLog_<pid>`) records what the client
 probed:
 
 ```
-header 48 B + 4096 slots x 64 B, magic 0x31544544, version 1
+header 48 B + 4096 slots x 64 B, magic 0x31544544, version 2
 per event: source, kind, verdict, caller, rva, tid, four arguments
+header: base, QPC start, heat, drop, pid, rate (drop counter)
 heat: weight by verdict and kind, linear decay over 30 s, capped at 100
 dedup: 128-slot open hash, Observed events folded in a 1 s window
 rate: kinds in K_RATE_MASK sampled once per thread per 100 ms
@@ -218,6 +227,30 @@ data is there. Kill the client before measuring the file.
 
 The sink is compiled out unless `config::DEBUG_LOG` is `true`; the release
 build keeps it `false` so nothing is written.
+
+The shared ring can exist in a release build without the JSONL sink, which is
+how a shipped binary stays observable without producing artifacts:
+
+```
+EMU_OBSERVE=1        environment variable, read once at load
+Local\RobloxObserve  named event; the reader creates it, the DLL only looks
+```
+
+Both paths open the ring and leave `detlog.jsonl` closed. The event exists
+because an elevated client never inherits an environment variable from a normal
+shell: `cargo xtask detlog --arm` creates it, waits for the process, prints the
+last events, and removes it when it exits.
+
+```
+cargo xtask detlog --arm --count 5     arm, then start the client
+cargo xtask detlog --count 5           read a client that is already running
+cargo xtask detlog --pid 1234 --follow stream new events as they land
+```
+
+The reader maps the section read-only, decodes the header and slots, and prints
+one line per event with the source, kind, verdict, caller as an RVA against the
+image base, thread id, and the two most useful arguments. `t=` is milliseconds
+since the module attached (QPC against the header start), not raw uptime.
 
 Boot-critical failures do not depend on that switch: `detlog::fatal()` writes to
 `boot.log` even in release, and falls back to `%TEMP%\emu_boot.log` when the
@@ -274,11 +307,12 @@ dll/                  the replacement DLL (cdylib)
   src/hooks.rs        identity hook and trampoline
   src/hwid.rs         hardware identity seeding
   src/probes.rs       enumeration/memory/query probes
-  src/detlog.rs       detection ring, JSONL output
+  src/detlog.rs       detection ring, JSONL output, live observe
   src/state.rs        process-global state
   src/util.rs         write helpers, jump encoders, path helpers
   src/win.rs          hand-written FFI (no windows/windows-sys crate)
-xtask/                payload packer/unpacker and image tools
+xtask/                payload packer/unpacker, image tools, detlog reader
+  src/detlog.rs       maps the detection ring and decodes it live
 ```
 
 ---
@@ -361,8 +395,9 @@ cargo test --release
 
 Tests cover payload decoding, image restore against a manually mapped image,
 import resolution, gate patches, the detection ring (layout, weights, decay,
-dedup, JSONL), the identity tables, the probe filters, the image fingerprint,
-the file-backed `.text` head reader and the entry-patch return contract.
+dedup, JSONL, rotation, live observe), the identity tables, the probe filters,
+the image fingerprint, the file-backed `.text` head reader and the entry-patch
+return contract.
 Fixtures (decrypted image, raw payload, compressed payload) are optional: point
 `EMU_FIXTURES` at a folder containing them to enable the four fixture tests,
 otherwise they return early:
@@ -394,6 +429,10 @@ pub const SSL_WRITE_EX: u32 = 0;     // SSL hook RVA (disabled for this build)
 
 Set `DEBUG_LOG = true` only for diagnosing a boot: every client timing probe
 then appends to `detlog.jsonl`, which grows quickly.
+
+For a shipped build, leave `DEBUG_LOG = false` and observe in place instead:
+`EMU_OBSERVE=1` or `cargo xtask detlog --arm` opens the shared ring without
+creating a single file.
 
 ---
 

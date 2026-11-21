@@ -13,6 +13,8 @@ pub type DWORD = u32;
 pub type WORD = u16;
 pub type ULONG_PTR = usize;
 
+pub const SYNCHRONIZE: u32 = 0x0010_0000;
+
 pub const MEM_COMMIT: DWORD = 0x0000_1000;
 pub const MEM_RESERVE: DWORD = 0x0000_2000;
 pub const MEM_RELEASE: DWORD = 0x0000_8000;
@@ -303,6 +305,8 @@ unsafe extern "system" {
     pub fn GetTickCount64() -> u64;
     pub fn Sleep(ms: DWORD);
     pub fn CloseHandle(handle: HANDLE) -> BOOL;
+    pub fn CreateEventW(attrs: *mut c_void, manual: BOOL, initial: BOOL, name: *const u16) -> HANDLE;
+    pub fn OpenEventW(access: DWORD, inherit: BOOL, name: *const u16) -> HANDLE;
     pub fn GetSystemInfo(info: *mut SystemInfo);
     pub fn GetProcessMitigationPolicy(
         process: HANDLE,
@@ -621,6 +625,7 @@ unsafe extern "system" {
     pub fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: DWORD) -> BOOL;
     pub fn DeleteFileW(name: *const u16) -> BOOL;
     pub fn GetTempPathW(len: DWORD, buf: *mut u16) -> DWORD;
+    pub fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, len: DWORD) -> DWORD;
     pub fn CreateFileMappingW(
         file: HANDLE,
         attributes: *mut c_void,

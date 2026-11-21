@@ -14,9 +14,45 @@ use crate::win;
 use core::ffi::c_void;
 use core::fmt::Write as _;
 use core::ptr;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub const ENABLED: bool = config::DEBUG_LOG;
+
+// The shared ring can exist without the JSONL sink. `EMU_OBSERVE=1` asks for
+// live observability from a release build, which must never touch disk.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn observe() -> bool {
+    env_observe() || observe_armed()
+}
+
+fn env_observe() -> bool {
+    // "EMU_OBSERVE" as UTF-16, null terminated.
+    let name: [u16; 12] = [
+        0x45, 0x4D, 0x55, 0x5F, 0x4F, 0x42, 0x53, 0x45, 0x52, 0x56, 0x45, 0,
+    ];
+    let mut buf = [0u16; 4];
+    let n = unsafe { win::GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    n == 1 && buf[0] == b'1' as u16
+}
+
+// An elevated client cannot be handed an environment variable, so the reader
+// can arm observation by creating this event before the client starts:
+// `xtask detlog --arm` holds it, the DLL sees it at load, and the mismatch goes
+// away. Existence is the whole protocol; no payload crosses the object.
+fn observe_armed() -> bool {
+    // "Local\RobloxObserve", null terminated.
+    let name: [u16; 20] = [
+        0x4C, 0x6F, 0x63, 0x61, 0x6C, 0x5C, 0x52, 0x6F, 0x62, 0x6C, 0x6F, 0x78, 0x4F, 0x62, 0x73,
+        0x65, 0x72, 0x76, 0x65, 0,
+    ];
+    let handle = unsafe { win::OpenEventW(win::SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe { win::CloseHandle(handle) };
+    true
+}
 
 const K_DECAY_MS: u64 = 30_000;
 const K_REPEAT_MS: u64 = 1_000;
@@ -34,7 +70,7 @@ const K_LOG_FILES: usize = 4;
 const _: () = assert!(K_RATE_SLOTS.is_power_of_two());
 
 pub const K_MAGIC: u32 = 0x3154_4544; // 'DET1'
-pub const K_VERSION: u32 = 1;
+pub const K_VERSION: u32 = 2;
 pub const K_CAPACITY: u32 = 4096;
 
 #[repr(u8)]
@@ -122,7 +158,7 @@ pub struct DetHeader {
     pub heat: u32,
     pub drop: u32,
     pub pid: u32,
-    pub pad: u32,
+    pub rate: u32,
 }
 
 pub const K_SECTION_SIZE: usize = core::mem::size_of::<DetHeader>()
@@ -505,6 +541,7 @@ fn record(
     }
     unsafe {
         (*g.hdr).heat = g.heat;
+        (*g.hdr).rate = g.rate_drop;
         if repeat(g, source, kind, verdict, caller, a0, ms) {
             (*g.hdr).drop = (*g.hdr).drop.wrapping_add(1);
             return;
@@ -711,8 +748,9 @@ unsafe fn rotate(g: &mut Globals) {
 // `dir` is the DLL's directory without a trailing separator; `base` is the
 // client image base used for the rva column. `tag` only exists so the tests can
 // open independent sections in one process — production passes 0 and gets the
-// reference name exactly.
-unsafe fn open(dir: &[u16], base: u64, tag: u32) -> bool {
+// reference name exactly. `want_log` opens the JSONL sink; the shared ring is
+// created either way.
+unsafe fn open(dir: &[u16], base: u64, tag: u32, want_log: bool) -> bool {
     let g = globals();
     if !g.cs_ok {
         unsafe { win::InitializeCriticalSection(&mut g.cs) };
@@ -754,7 +792,10 @@ unsafe fn open(dir: &[u16], base: u64, tag: u32) -> bool {
                 (*g.hdr).version = K_VERSION;
                 (*g.hdr).capacity = K_CAPACITY;
                 (*g.hdr).base = base;
-                (*g.hdr).start = win::GetTickCount64();
+                // QPC origin, the same clock domain as DetEvent::tick.
+                let mut qpc = 0i64;
+                win::QueryPerformanceCounter(&mut qpc);
+                (*g.hdr).start = qpc as u64;
                 (*g.hdr).pid = pid;
                 g.ring = (g.hdr as *mut u8).add(core::mem::size_of::<DetHeader>())
                     as *mut DetEvent;
@@ -762,6 +803,11 @@ unsafe fn open(dir: &[u16], base: u64, tag: u32) -> bool {
         }
     }
     g.base = base;
+    let live = !g.hdr.is_null();
+    ACTIVE.store(live, Ordering::Release);
+    if !want_log {
+        return live;
+    }
 
     let mut path = WideBuf::<{ win::MAX_PATH }>::new();
     let mut have_path = false;
@@ -823,6 +869,7 @@ unsafe fn close() {
     g.rate_drop = 0;
     g.dir_len = 0;
     g.log_bytes = 0;
+    ACTIVE.store(false, Ordering::Release);
     for slot in g.rate.iter_mut() {
         *slot = RateSlot::EMPTY;
     }
@@ -831,36 +878,55 @@ unsafe fn close() {
     }
 }
 
+// Emulator-origin timestamp for the first-hit stamps, so `at=` reads as ms
+// since the module attached instead of raw system uptime.
+static T0_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn boot_ms() -> u64 {
+    let now = unsafe { win::GetTickCount64() };
+    match T0_MS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed) {
+        Ok(_) => 0,
+        Err(t0) => now.saturating_sub(t0),
+    }
+}
+
 pub fn det_init() -> bool {
-    if !ENABLED {
+    let live = ENABLED || observe();
+    if !live {
         return true;
     }
-    unsafe { open(state::dir(), state::base() as u64, 0) }
+    let _ = T0_MS.compare_exchange(
+        0,
+        unsafe { win::GetTickCount64() },
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+    unsafe { open(state::dir(), state::base() as u64, 0, ENABLED) }
 }
 
 pub unsafe fn det_close() {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Acquire) {
         return;
     }
     unsafe { close() }
 }
 
 pub fn det_snapshot() {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Acquire) {
         return;
     }
     snapshot(globals())
 }
 
 pub fn det_heat() -> u32 {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Acquire) {
         return 0;
     }
     globals().heat
 }
 
 pub fn det_events() -> u32 {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Acquire) {
         return 0;
     }
     let g = globals();
@@ -871,7 +937,7 @@ pub fn det_events() -> u32 {
 }
 
 pub fn det_rate_drop() -> u32 {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Acquire) {
         return 0;
     }
     globals().rate_drop
@@ -892,7 +958,7 @@ pub fn det(
     a2: u64,
     a3: u64,
 ) {
-    if !ENABLED {
+    if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     let g = globals();
@@ -1135,7 +1201,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<SeenSlot>(), 32);
         assert_eq!(K_SECTION_SIZE, 262_192);
         assert_eq!(K_MAGIC, 0x3154_4544);
-        assert_eq!(K_VERSION, 1);
+        assert_eq!(K_VERSION, 2);
         assert_eq!(K_CAPACITY, 4096);
     }
 
@@ -1343,7 +1409,7 @@ mod tests {
         let dir = TempDir::new("jsonl");
         let g = globals();
         unsafe { close() };
-        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0001) });
+        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0001, true) });
 
         record(
             g,
@@ -1378,7 +1444,10 @@ mod tests {
         let text = dir.text("detlog.jsonl");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
-        assert!(lines[0].starts_with("{\"t\":287454020,\"seq\":0,\"src\":\"Emulator\","));
+        assert!(
+            lines[0].starts_with("{\"t\":287454020,\"seq\":0,\"src\":\"Emulator\","),
+            "{text}"
+        );
         assert!(lines[0].contains("\"kind\":\"Resolve\""));
         assert!(lines[0].contains("\"verdict\":\"Observed\""));
         assert!(lines[0].contains("\"caller\":\"0x14001234\""));
@@ -1411,10 +1480,10 @@ mod tests {
         let a = TempDir::new("tag-a");
         let b = TempDir::new("tag-b");
         unsafe { close() };
-        assert!(unsafe { open(&a.wide(), 0x1000_0000, 0x5EED_0002) });
+        assert!(unsafe { open(&a.wide(), 0x1000_0000, 0x5EED_0002, true) });
         let first = globals().hdr;
         unsafe { close() };
-        assert!(unsafe { open(&b.wide(), 0x2000_0000, 0x5EED_0003) });
+        assert!(unsafe { open(&b.wide(), 0x2000_0000, 0x5EED_0003, true) });
         // The view can land at the same address after a close; the
         // stamped header is what proves this is a fresh section.
         let _ = first;
@@ -1427,7 +1496,7 @@ mod tests {
         let _guard = crate::testlock::lock();
         let dir = TempDir::new("stamp");
         unsafe { close() };
-        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0004) });
+        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0004, true) });
         let g = globals();
         assert_eq!(unsafe { (*g.hdr).magic }, K_MAGIC);
         assert_eq!(unsafe { (*g.hdr).version }, K_VERSION);
@@ -1541,6 +1610,9 @@ mod tests {
 
     #[test]
     fn det_entry_points_are_noops_when_disabled() {
+        // These entry points read and write the process-wide sink, so they must
+        // not run beside a test that has one open.
+        let _guard = crate::testlock::lock();
         // The release configuration compiles the sink out.
         if !ENABLED {
             det(
@@ -1689,5 +1761,47 @@ mod tests {
         assert!(flush_log(&g));
         unsafe { win::CloseHandle(g.log) };
         assert_eq!(dir.text("detlog.jsonl"), "x");
+    }
+
+    #[test]
+    fn observe_reads_the_environment() {
+        // std::env writes the real process block, so this is the exact lookup
+        // the client performs at load time.
+        unsafe { std::env::set_var("EMU_OBSERVE", "1") };
+        assert!(observe());
+        unsafe { std::env::set_var("EMU_OBSERVE", "0") };
+        assert!(!observe());
+        unsafe { std::env::remove_var("EMU_OBSERVE") };
+        assert!(!observe());
+    }
+
+    #[test]
+    fn observe_armed_event_is_enough() {
+        let name: [u16; 20] = [
+            0x4C, 0x6F, 0x63, 0x61, 0x6C, 0x5C, 0x52, 0x6F, 0x62, 0x6C, 0x6F, 0x78, 0x4F, 0x62,
+            0x73, 0x65, 0x72, 0x76, 0x65, 0,
+        ];
+        let event = unsafe { win::CreateEventW(ptr::null_mut(), 1, 0, name.as_ptr()) };
+        assert!(!event.is_null());
+        assert!(observe());
+        unsafe { win::CloseHandle(event) };
+        assert!(!observe());
+    }
+
+    #[test]
+    fn observe_open_maps_a_ring_without_a_log() {
+        let _guard = crate::testlock::lock();
+        let dir = TempDir::new("observe");
+        unsafe { close() };
+        assert!(unsafe { open(&dir.wide(), 0x1400_0000, 0x5EED_0005, false) });
+        let g = globals();
+        assert!(!g.hdr.is_null());
+        assert_eq!(g.log, win::INVALID_HANDLE_VALUE);
+        assert_eq!(g.log_bytes, 0);
+        assert!(ACTIVE.load(Ordering::Acquire));
+        assert!(!dir.file("detlog.jsonl").exists());
+        assert_eq!(unsafe { (*g.hdr).version }, K_VERSION);
+        unsafe { close() };
+        assert!(!ACTIVE.load(Ordering::Acquire));
     }
 }

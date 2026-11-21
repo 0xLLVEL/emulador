@@ -20,6 +20,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // evidence needed before PROTECTED_SERVICES_VERIFIED can be flipped.
 static COVERAGE_MASK: AtomicU32 = AtomicU32::new(0);
 static COVERAGE_HITS: AtomicU32 = AtomicU32::new(0);
+// First client hit per rule, in GetTickCount64 ms. Probes never write here.
+static FIRST_MS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static REPORTED: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 fn mark(index: usize) {
@@ -48,12 +51,24 @@ pub fn coverage_log(tag: &str) {
     crate::detlog::trace(&format!(
         "{tag}: svc self={probed}/{total} mask={probe:#010x}"
     ));
+    let fresh = mask & !REPORTED.swap(mask, Ordering::AcqRel);
     for (index, rule) in p::RULES.iter().enumerate() {
-        if mask & (1u32 << index) == 0 {
+        if fresh & (1u32 << index) != 0 {
             crate::detlog::trace(&format!(
-                "{tag}: svc idle {index} {:?} fault={} ret=0x{:08X}",
-                rule.service, rule.fault, rule.ret_rva
+                "{tag}: svc new {index} {:?} at={}ms",
+                rule.service,
+                FIRST_MS[index].load(Ordering::Acquire)
             ));
+        }
+    }
+    if tag == "boot" {
+        for (index, rule) in p::RULES.iter().enumerate() {
+            if mask & (1u32 << index) == 0 {
+                crate::detlog::trace(&format!(
+                    "{tag}: svc idle {index} {:?} fault={} ret=0x{:08X}",
+                    rule.service, rule.fault, rule.ret_rva
+                ));
+            }
         }
     }
 }
@@ -382,6 +397,12 @@ unsafe extern "system" fn veh_filter(pointers: *mut win::ExceptionPointers) -> i
                 PROBE_MASK.fetch_or(1u32 << index, Ordering::AcqRel);
             } else {
                 mark(index);
+                let _ = FIRST_MS[index].compare_exchange(
+                    0,
+                    crate::detlog::boot_ms().max(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
             }
 
             let ok = svc(cx, rule.service);
