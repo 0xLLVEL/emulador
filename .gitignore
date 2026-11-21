@@ -1,0 +1,15 @@
+target/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.log
+*.jsonl
+*.dmp
+assets/
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

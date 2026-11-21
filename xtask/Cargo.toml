@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+brotli = { version = "=9.1.3", features = ["std"] }
+brotli-decompressor = { version = "=6.3.2", default-features = false, features = ["std"] }

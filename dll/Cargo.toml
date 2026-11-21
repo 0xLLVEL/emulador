@@ -1,0 +1,12 @@
+[package]
+name = "emulator-dll"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "roblox_player_beta"
+crate-type = ["cdylib"]
+
+[dependencies]
+brotli-decompressor = { version = "=6.3.2", default-features = false, features = ["std"] }
